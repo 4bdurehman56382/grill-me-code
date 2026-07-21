@@ -1,16 +1,19 @@
 # Grill Me Code
 
-`grill-me-code` is a Codex skill for adversarial technical review. It turns a codebase, diff, pull request, implementation plan, or architecture proposal into a focused grilling session around correctness, tests, security, reliability, maintainability, and deployment risk.
+`grill-me-code` is a tiny Codex skill that mirrors `grill-me`, but routes the grilling session toward code, diffs, implementation plans, architecture, tests, and technical decisions.
 
-It is intentionally direct: the skill asks uncomfortable, concrete questions and pushes toward evidence, tests, and fixes.
+It intentionally keeps the same handoff-style mechanics as `grill-me`:
+
+```md
+Run a `/grilling` session for code.
+```
 
 ## Use Cases
 
 - Stress-test an implementation plan before coding.
 - Grill a pull request before review.
-- Interrogate a risky refactor, migration, integration, or release plan.
-- Find missing tests and edge cases.
-- Challenge security, privacy, multi-tenant, and operational assumptions.
+- Interrogate a refactor, migration, integration, or release plan.
+- Sharpen tests, architecture, and technical tradeoffs.
 
 ## Install
 
@@ -53,7 +56,7 @@ Use $grill-me-code. Do not fix anything yet; just ask the hard questions.
 - `SKILL.md`: the skill instructions Codex loads when triggered.
 - `agents/openai.yaml`: UI metadata for skill lists and prompt chips.
 
-No scripts or heavy references are included. This skill is intentionally lightweight.
+No scripts or heavy references are included. This skill is intentionally lightweight and behaves like `grill-me`, just code-focused.
 
 ## Validation
 
