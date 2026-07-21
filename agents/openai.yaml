@@ -1,0 +1,4 @@
+interface:
+  display_name: "Grill Me Code"
+  short_description: "Interrogate code until risks are clear."
+  default_prompt: "Use $grill-me-code to interrogate this code or implementation plan for correctness, tests, security, edge cases, maintainability, and deployment risk."
