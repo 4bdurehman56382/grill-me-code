@@ -23,6 +23,8 @@ The gap: developers also need a local, forkable, agent-native workflow that:
 - checks rollback, wiring, migration, auth, and observability
 - coordinates review -> fix -> re-review with bounded loops
 - keeps artifacts that humans and agents can resume
+- runs available local checks instead of only describing them
+- records finding outcomes so the team can learn which grills catch real bugs
 
 ## High-End Product Promise
 
@@ -41,6 +43,10 @@ The repo should feel like:
 ### CODE-GRILL-PACKET
 
 A generated markdown artifact containing scope, risk lenses, hard questions, proof ladder, and verdict contract.
+
+### CODE-GRILL Runner
+
+A dependency-free CLI that resolves scope, runs builtin static heuristics, discovers project checks, optionally runs those checks, assigns risk/proof/ship scores, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
 
 ### Jury Mode
 
@@ -73,6 +79,10 @@ The final output says one of:
 - `BLOCKED`
 
 Each verdict must include evidence.
+
+### Optional GSD Bridge
+
+The runner detects `.planning/`, `STATE.md`, `ROADMAP.md`, phase files, and `gsd-sdk` when present. It imports GSD context into the report without requiring or vendoring the full GSD runtime.
 
 ## Fork Hooks
 

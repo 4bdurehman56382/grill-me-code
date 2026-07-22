@@ -14,7 +14,17 @@ jobs:
           python-version: "3.12"
       - name: Validate skill shape
         run: python3 scripts/validate_skill.py
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests
       - name: Smoke-test packet generator
         run: |
           python3 scripts/grill_packet.py --mode repo --max-files 8 --output /tmp/CODE-GRILL-PACKET.md
           grep -q "## Jury Mode" /tmp/CODE-GRILL-PACKET.md
+      - name: Smoke-test runner engine
+        run: |
+          python3 scripts/grill_runner.py --mode repo --max-files 8 --output-dir /tmp/grill-me-code
+          grep -q "CODE-GRILL-REPORT" /tmp/grill-me-code/CODE-GRILL-REPORT.md
+      - name: Smoke-test learning loop
+        run: |
+          python3 scripts/grill_learn.py --finding SAMPLE-001 --outcome needs_followup --store /tmp/grill-me-code/learnings.json
+          grep -q "SAMPLE-001" /tmp/grill-me-code/learnings.json

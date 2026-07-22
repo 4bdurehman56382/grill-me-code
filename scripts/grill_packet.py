@@ -48,6 +48,21 @@ RISK_PATTERNS = {
 }
 
 
+def repo_priority(path: Path) -> tuple[int, str]:
+    rel = str(path).replace("\\", "/").lower()
+    code_suffixes = (".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".sh")
+    test_markers = ("/test", "/tests", "__tests__", ".test.", ".spec.")
+    if any(marker in rel for marker in test_markers):
+        return (0, rel)
+    if rel.startswith(("src/", "lib/", "scripts/", "bin/")) or path.suffix.lower() in code_suffixes:
+        return (1, rel)
+    if rel.startswith((".github/", "agents/", "assets/")):
+        return (2, rel)
+    if path.suffix.lower() in {".md", ".txt", ".yaml", ".yml", ".json"}:
+        return (3, rel)
+    return (4, rel)
+
+
 def run_git(root: Path, *args: str) -> str:
     try:
         return subprocess.check_output(["git", "-C", str(root), *args], text=True, stderr=subprocess.DEVNULL)
@@ -79,15 +94,20 @@ def git_diff_files(root: Path, base: str | None) -> list[Path]:
 
 
 def git_repo_files(root: Path, limit: int) -> list[Path]:
-    raw = run_git(root, "ls-files")
+    raw = "\n".join([
+        run_git(root, "ls-files"),
+        run_git(root, "ls-files", "--others", "--exclude-standard"),
+    ])
     files = []
+    seen = set()
     for line in raw.splitlines():
         path = root / line.strip()
+        if path in seen:
+            continue
+        seen.add(path)
         if path.exists() and path.is_file() and not is_generated(path.relative_to(root)):
             files.append(path)
-        if len(files) >= limit:
-            break
-    return files
+    return sorted(files, key=lambda path: repo_priority(path.relative_to(root)))[:limit]
 
 
 def scoped_files(root: Path, values: list[str]) -> list[Path]:

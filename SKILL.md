@@ -14,7 +14,8 @@ When no runner is available, run the grilling loop inline using this skill.
    - Prefer explicitly named files, diffs, PRs, plans, or commands.
    - Otherwise use the current git diff.
    - If the user asks for repo-wide grilling, sample architecture first, then inspect hot paths.
-   - For a reusable artifact, run `scripts/grill_packet.py` to create `CODE-GRILL-PACKET.md`.
+   - For a complete engine pass, run `scripts/grill_runner.py` to create packet, report, scores, state, and verdict.
+   - For only a reusable artifact, run `scripts/grill_packet.py` to create `CODE-GRILL-PACKET.md`.
    - Fail closed on unclear destructive or production-impacting actions.
 2. Pick depth:
    - `quick`: fast pattern and risk scan.
@@ -29,6 +30,7 @@ When no runner is available, run the grilling loop inline using this skill.
    - Edit narrowly.
    - Verify with the project's real checks.
    - Re-grill the changed surface once more.
+   - Record finding outcomes with `scripts/grill_learn.py` when the user confirms real bug, false positive, accepted risk, or follow-up.
 5. Close with a machine-readable marker:
    - `## GRILLING COMPLETE` when no blocking concerns remain.
    - `## ISSUES FOUND` when there are unresolved blockers or warnings.
@@ -43,6 +45,7 @@ When no runner is available, run the grilling loop inline using this skill.
 - For reusable prompt shapes, read `references/prompt-patterns.md`.
 - For market positioning and fork-worthy product direction, read `references/market-positioning.md`.
 - For multi-lens adversarial review, read `references/jury-mode.md`.
+- For the runner engine and CI hooks, prefer `scripts/grill_runner.py` and `assets/github-actions/grill-me-code.yml`.
 
 ## Review Stance
 
@@ -88,4 +91,4 @@ Keep outputs concise unless the user asks for a full artifact.
 
 ## Differentiator
 
-Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, multi-lens review, fix loop, verification receipts, and a final ship/no-ship verdict.
+Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, built-in static heuristics, available-tool checks, GSD context bridging, fix loop, learning records, verification receipts, and a final ship/no-ship verdict.

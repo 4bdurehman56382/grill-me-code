@@ -2,6 +2,8 @@
 
 This file imports the useful coordination patterns from the local GSD workflow without depending on Claude-only commands or vendoring the full GSD repository.
 
+Use `scripts/grill_runner.py --gsd-phase <phase-prefix>` when a repo has `.planning/` artifacts and you want the report to include GSD phase context.
+
 ## GSD Patterns To Use
 
 Scope with explicit precedence:
@@ -47,6 +49,9 @@ If producing an artifact, use a stable file name:
 - `CODE-GRILL-REVIEW.md`
 - `CODE-GRILL-FIX.md`
 - `CODE-GRILL-VERIFY.md`
+- `CODE-GRILL-PACKET.md`
+- `CODE-GRILL-REPORT.md`
+- `.grill-me-code/latest.json`
 
 ## Artifact Frontmatter
 
@@ -107,3 +112,12 @@ Use these as conceptual modes, not required slash commands:
 - `fix`: apply verified fixes to review findings
 - `verify`: goal-backward proof that behavior works
 - `converge`: repeat review and fix until blockers are gone or iteration cap is hit
+
+## Why Not Vendor GSD
+
+Do not copy the whole GSD runtime into this skill unless the repo license and update strategy are explicit. Prefer the bridge:
+
+- detect `.planning/`
+- include current state and phase artifacts
+- use `gsd-sdk` when available
+- keep `grill-me-code` runnable without GSD

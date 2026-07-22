@@ -81,6 +81,16 @@ def main():
     if "CODE-GRILL-PACKET" not in packet_script.read_text(encoding="utf-8"):
         fail("grill_packet.py should generate CODE-GRILL-PACKET artifacts")
 
+    for rel in [
+        "scripts/grill_runner.py",
+        "scripts/grill_learn.py",
+        "assets/github-actions/grill-me-code.yml",
+        "examples/CODE-GRILL-PACKET.sample.md",
+        "examples/CODE-GRILL-REPORT.sample.md",
+        "tests/test_runner.py",
+    ]:
+        read(ROOT / rel)
+
     print("skill validation ok")
 
 
