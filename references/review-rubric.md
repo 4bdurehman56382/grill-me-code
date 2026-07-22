@@ -41,6 +41,10 @@ If the scope is too large, split it:
 
 ## Severity
 
+`Blocked`:
+- missing files, missing plan/config, inaccessible scope, or unsafe permissions prevent a trustworthy review
+- use for setup/configuration failures, not for confirmed bad code
+
 `Blocker`:
 - wrong behavior
 - crash, data loss, security exposure, auth bypass
@@ -63,6 +67,8 @@ If the scope is too large, split it:
 `Nit`:
 - polish, naming, small consistency issue
 - never bury blockers under nits
+
+Config/setup failures should usually produce `BLOCKED`. Confirmed code hazards should produce `DO NOT SHIP`.
 
 ## Finding Shape
 

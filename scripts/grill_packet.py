@@ -140,7 +140,7 @@ def file_summary(root: Path, path: Path) -> dict[str, object]:
             tags.append(tag)
     return {
         "path": str(rel),
-        "lines": text.count("\n") + (1 if text else 0),
+        "lines": len(text.splitlines()),
         "bytes": path.stat().st_size,
         "tags": tags or ["general"],
     }
@@ -251,6 +251,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.mode == "scope" and not args.scope:
+        print("--mode scope requires at least one --scope value.", file=sys.stderr)
+        return 2
     if args.max_files < 1:
         print("--max-files must be a positive integer.", file=sys.stderr)
         return 2

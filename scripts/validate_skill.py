@@ -82,6 +82,7 @@ def main():
         fail("grill_packet.py should generate CODE-GRILL-PACKET artifacts")
 
     for rel in [
+        ".grill-me-code.example.yaml",
         "scripts/grill_runner.py",
         "scripts/grill_learn.py",
         "assets/github-actions/grill-me-code.yml",
@@ -90,6 +91,11 @@ def main():
         "tests/test_runner.py",
     ]:
         read(ROOT / rel)
+
+    runner = read(ROOT / "scripts" / "grill_runner.py")
+    for token in ["load_config", "write_baseline", "split_suppressed_findings", "ThreadPoolExecutor"]:
+        if token not in runner:
+            fail(f"grill_runner.py missing {token}")
 
     print("skill validation ok")
 

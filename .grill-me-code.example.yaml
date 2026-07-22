@@ -1,0 +1,33 @@
+thresholds:
+  severity_weights:
+    blocker: 30
+    warning: 12
+    question: 5
+    nit: 1
+    blocked: 0
+  failed_check_risk: 20
+  ship_with_risks_risk: 35
+  min_proof_ship: 60
+
+test_proof:
+  # code: require test proof for app/source files only
+  # always: require test proof for any reviewed file
+  # off: disable the no-test finding
+  mode: code
+
+severity_overrides:
+  # BUG-002: nit
+  # OPS-002: question
+
+ignore:
+  findings: []
+  codes: []
+  fingerprints: []
+  paths:
+    - examples/**
+
+static_patterns:
+  - code: TEAM-001
+    severity: warning
+    regex: dangerousCall\(
+    title: Team-specific dangerous call needs a safer wrapper or proof.

@@ -24,6 +24,7 @@ The gap: developers also need a local, forkable, agent-native workflow that:
 - coordinates review -> fix -> re-review with bounded loops
 - keeps artifacts that humans and agents can resume
 - runs available local checks instead of only describing them
+- lets teams tune policy with config, baselines, suppressions, and severity overrides
 - records finding outcomes so the team can learn which grills catch real bugs
 
 ## High-End Product Promise
@@ -46,7 +47,11 @@ A generated markdown artifact containing scope, risk lenses, hard questions, pro
 
 ### CODE-GRILL Runner
 
-A dependency-free CLI that resolves scope, runs builtin static heuristics, discovers project checks, optionally runs those checks, assigns risk/proof/ship scores, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
+A dependency-free CLI that resolves scope, runs configurable static heuristics, discovers project checks, optionally runs those checks, separates setup-blocked findings from code risk, assigns risk/proof/ship scores, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
+
+### Policy Memory
+
+Baselines and learning records let teams suppress accepted findings by stable fingerprints while still surfacing new evidence.
 
 ### Jury Mode
 
@@ -91,5 +96,6 @@ Make the repo easy to fork by keeping:
 - references short and composable
 - scripts dependency-free
 - artifact formats stable
+- config and baseline formats human-editable
 - marker headings machine-readable
 - prompts easy to customize per team

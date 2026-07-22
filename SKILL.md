@@ -16,11 +16,13 @@ When no runner is available, run the grilling loop inline using this skill.
    - If the user asks for repo-wide grilling, sample architecture first, then inspect hot paths.
    - For a complete engine pass, run `scripts/grill_runner.py` to create packet, report, scores, state, and verdict.
    - For only a reusable artifact, run `scripts/grill_packet.py` to create `CODE-GRILL-PACKET.md`.
+   - If the runner script is unavailable or cannot execute in the current environment, say that plainly and fall back to inline review. Do not claim tool-backed checks, scores, or receipts that were not actually produced.
    - Fail closed on unclear destructive or production-impacting actions.
 2. Pick depth:
    - `quick`: fast pattern and risk scan.
    - `standard`: default file-by-file review with tests and edge cases.
    - `deep`: cross-file architecture, invariants, migration, security, and release readiness.
+   - Use `--progress` for longer runner scans when the user benefits from incremental check status.
 3. Grill first:
    - Ask the hard questions that would change the implementation.
    - Identify blockers, warnings, missing proof, and false confidence.
@@ -31,6 +33,7 @@ When no runner is available, run the grilling loop inline using this skill.
    - Verify with the project's real checks.
    - Re-grill the changed surface once more.
    - Record finding outcomes with `scripts/grill_learn.py` when the user confirms real bug, false positive, accepted risk, or follow-up.
+   - Use config, baselines, and learnings when present; do not re-raise accepted findings unless new evidence changes the risk.
 5. Close with a machine-readable marker:
    - `## GRILLING COMPLETE` when no blocking concerns remain.
    - `## ISSUES FOUND` when there are unresolved blockers or warnings.
@@ -87,8 +90,8 @@ Keep outputs concise unless the user asks for a full artifact.
 - `Refactor Crucible`: prove behavior survives a refactor.
 - `Shiproom`: inspect release, migration, rollback, config, and observability risk.
 - `Fix Receipts`: apply fixes and produce proof commands/results.
-- `Jury Mode`: run the same scope through multiple lenses before verdict.
+- `Jury Mode`: run the same scope through multiple lenses before verdict. When using the runner, tie each lens to actual findings, check results, or missing proof; when only working inline, label it as reasoning-only.
 
 ## Differentiator
 
-Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, built-in static heuristics, available-tool checks, GSD context bridging, fix loop, learning records, verification receipts, and a final ship/no-ship verdict.
+Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, configurable static heuristics, available-tool checks, baselines, learning records, GSD context bridging, fix loop, verification receipts, and a final ship/no-ship verdict.

@@ -1,6 +1,10 @@
 import tempfile
 from pathlib import Path
 import sys
+import contextlib
+import io
+import json
+import os
 import unittest
 
 
@@ -8,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import grill_packet
+import grill_learn
 import grill_runner
 
 
@@ -40,6 +45,74 @@ class GrillRunnerTests(unittest.TestCase):
             findings = grill_runner.static_findings(root, [source])
             self.assertEqual(findings[0]["severity"], "blocker")
 
+    def test_static_findings_detect_path_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "download.py"
+            source.write_text("open(request.args['path'])\n", encoding="utf-8")
+            findings = grill_runner.static_findings(root, [source])
+            self.assertEqual(findings[0]["code"], "SEC-005")
+
+    def test_custom_config_pattern_and_suppression(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / ".grill-me-code.yaml"
+            config_path.write_text(
+                "\n".join([
+                    "ignore_codes:",
+                    "  - BUG-002",
+                    "static_patterns:",
+                    "  - code: TEAM-001",
+                    "    severity: warning",
+                    "    regex: dangerousCall\\(",
+                    "    title: Team-specific dangerous call",
+                ]),
+                encoding="utf-8",
+            )
+            config, config_findings, _ = grill_runner.load_config(root, None)
+            patterns, pattern_findings = grill_runner.compile_static_patterns(config)
+            source = root / "app.js"
+            source.write_text("dangerousCall(user)\n// TODO later\n", encoding="utf-8")
+            raw = grill_runner.static_findings(root, [source], patterns)
+            active, suppressed = grill_runner.split_suppressed_findings(raw, config, {"findings": []}, {"outcomes": []})
+            self.assertEqual(config_findings + pattern_findings, [])
+            self.assertEqual([finding["code"] for finding in active], ["TEAM-001"])
+            self.assertEqual([finding["code"] for finding in suppressed], ["BUG-002"])
+
+    def test_simple_yaml_load_handles_nested_config(self):
+        data = grill_runner.simple_yaml_load(
+            "\n".join([
+                "thresholds:",
+                "  severity_weights:",
+                "    blocker: 40",
+                "ignore:",
+                "  paths:",
+                "    - examples/**",
+                "static_patterns:",
+                "  - code: TEAM-001",
+                "    severity: warning",
+                "    regex: dangerousCall\\(",
+            ])
+        )
+        self.assertEqual(data["thresholds"]["severity_weights"]["blocker"], 40)
+        self.assertEqual(data["ignore"]["paths"], ["examples/**"])
+        self.assertEqual(data["static_patterns"][0]["code"], "TEAM-001")
+
+    def test_baseline_suppresses_fingerprint(self):
+        finding = {
+            "id": "SEC-001-001",
+            "severity": "blocker",
+            "file": "danger.py",
+            "title": "Dynamic code execution can become injection.",
+            "evidence": "eval(user_input)",
+            "source": "builtin-static",
+        }
+        grill_runner.annotate_findings([finding])
+        baseline = {"findings": [{"fingerprint": finding["fingerprint"]}]}
+        active, suppressed = grill_runner.split_suppressed_findings([finding], grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {})), baseline, {"outcomes": []})
+        self.assertEqual(active, [])
+        self.assertEqual(suppressed[0]["suppressed_by"], "baseline")
+
     def test_score_uses_blockers_for_do_not_ship(self):
         score = grill_runner.score_session(
             [Path("danger.py")],
@@ -49,6 +122,167 @@ class GrillRunnerTests(unittest.TestCase):
             code_files=1,
         )
         self.assertEqual(score["verdict"], "DO NOT SHIP")
+
+    def test_plan_config_error_is_blocked_not_do_not_ship(self):
+        score = grill_runner.score_session(
+            [Path("app.py")],
+            [{"severity": "blocked"}],
+            [],
+            test_files=0,
+            code_files=1,
+        )
+        self.assertEqual(score["verdict"], "BLOCKED")
+        self.assertEqual(score["risk_score"], 0)
+
+    def test_non_code_scope_does_not_require_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dockerfile = root / "Dockerfile"
+            dockerfile.write_text("FROM python:3.12\n", encoding="utf-8")
+            config = grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {}))
+            self.assertFalse(grill_runner.needs_test_proof([dockerfile], config))
+
+    def test_markdown_report_includes_suppressed_summary(self):
+        session = {
+            "session_id": "sample",
+            "generated": "2026-01-01T00:00:00+00:00",
+            "mode": "scope",
+            "depth": "standard",
+            "files": ["app.py"],
+            "config_path": ".grill-me-code.yaml",
+            "baseline": {"path": ".grill-me-code/baseline.json"},
+            "findings": [],
+            "suppressed_findings": [{"id": "BUG-002-001", "title": "TODO", "file": "app.py", "line": 1, "suppressed_by": "baseline"}],
+            "checks": {"results": [], "discovered": [], "run_project_checks": False},
+            "gsd": {"detected": False},
+            "score": {"verdict": "SHIP", "risk_score": 0, "proof_score": 80, "ship_score": 100},
+        }
+        report = grill_runner.markdown_report(session)
+        self.assertIn("Suppressed findings: 1", report)
+        self.assertIn("## Suppressed Findings", report)
+
+    def test_discover_project_checks_reads_package_scripts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text('{"scripts":{"lint":"eslint .","test":"node test.js"}}', encoding="utf-8")
+            names = [item["name"] for item in grill_runner.discover_project_checks(root)]
+            self.assertIn("npm:lint", names)
+            self.assertIn("npm:test", names)
+
+    def test_run_project_checks_records_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checks = [{"name": "fail", "kind": "test", "command": [sys.executable, "-c", "raise SystemExit(7)"]}]
+            result = grill_runner.run_project_checks(root, checks, timeout=5)
+            self.assertFalse(result[0]["ok"])
+            self.assertEqual(result[0]["returncode"], 7)
+
+    def test_run_command_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = grill_runner.run_command([sys.executable, "-c", "import time; time.sleep(2)"], root, timeout=1)
+            self.assertTrue(result["timed_out"])
+
+    def test_build_packet_output_contains_scope_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.py"
+            source.write_text("print('ok')\n", encoding="utf-8")
+            packet = grill_packet.build_packet(root, [source], "scope", "standard", "CODE-GRILL-PACKET")
+            self.assertIn("| `app.py` | 1 | general |", packet)
+            self.assertIn("## Verdict Contract", packet)
+
+    def test_runner_scope_without_scope_exits_loudly(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = grill_runner.main(["--mode", "scope"])
+        self.assertEqual(code, 2)
+        self.assertIn("requires at least one --scope", stderr.getvalue())
+
+    def test_runner_fail_on_do_not_ship_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "danger.py").write_text("eval(user_input)\n", encoding="utf-8")
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = grill_runner.main(["--scope", "danger.py", "--output-dir", ".out", "--fail-on-do-not-ship"])
+            finally:
+                os.chdir(old_cwd)
+            session = json.loads((root / ".out" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 1)
+            self.assertEqual(session["score"]["verdict"], "DO NOT SHIP")
+
+    def test_runner_missing_plan_file_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = grill_runner.main(["--scope", "app.py", "--plan", "missing-plan.md", "--output-dir", ".out", "--fail-on-do-not-ship"])
+            finally:
+                os.chdir(old_cwd)
+            session = json.loads((root / ".out" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 1)
+            self.assertEqual(session["score"]["verdict"], "BLOCKED")
+            self.assertEqual(session["findings"][0]["severity"], "blocked")
+
+    def test_runner_write_baseline_suppresses_next_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "danger.py").write_text("eval(user_input)\n", encoding="utf-8")
+            (root / ".grill-me-code.yaml").write_text("test_proof:\n  mode: off\n", encoding="utf-8")
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    first_code = grill_runner.main(["--scope", "danger.py", "--output-dir", ".out", "--write-baseline"])
+                    second_code = grill_runner.main(["--scope", "danger.py", "--output-dir", ".out"])
+            finally:
+                os.chdir(old_cwd)
+            session = json.loads((root / ".out" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(first_code, 0)
+            self.assertEqual(second_code, 0)
+            self.assertEqual(session["findings"], [])
+            self.assertEqual(len(session["suppressed_findings"]), 1)
+            self.assertEqual(session["suppressed_findings"][0]["suppressed_by"], "baseline")
+
+    def test_grill_learn_verifies_session_finding_and_stores_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "latest.json"
+            store = root / "learnings.json"
+            finding = {
+                "id": "SEC-001-001",
+                "severity": "blocker",
+                "file": "danger.py",
+                "title": "Dynamic code execution can become injection.",
+                "evidence": "eval(user_input)",
+                "source": "builtin-static",
+            }
+            grill_runner.annotate_findings([finding])
+            session.write_text(json.dumps({"findings": [finding]}), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = grill_learn.main(["--finding", "SEC-001-001", "--outcome", "false_positive", "--session", str(session), "--store", str(store)])
+            data = json.loads(store.read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertTrue(data["outcomes"][0]["session_verified"])
+            self.assertEqual(data["outcomes"][0]["fingerprint"], finding["fingerprint"])
+
+    def test_grill_learn_rejects_unknown_session_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "latest.json"
+            store = root / "learnings.json"
+            session.write_text(json.dumps({"findings": []}), encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = grill_learn.main(["--finding", "SEC-001-001", "--outcome", "false_positive", "--session", str(session), "--store", str(store)])
+            self.assertEqual(code, 2)
+            self.assertIn("was not found", stderr.getvalue())
 
     def test_detect_gsd_planning_context(self):
         with tempfile.TemporaryDirectory() as tmp:

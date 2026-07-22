@@ -1,6 +1,6 @@
 interface:
   display_name: "Grill Me Code"
-  short_description: "Runner-backed code grills with ship verdicts."
-  default_prompt: "Use $grill-me-code to run scripts/grill_runner.py, generate CODE-GRILL-PACKET and CODE-GRILL-REPORT, review blockers, verify checks, and give a ship verdict."
+  short_description: "Runner-backed code grills with policy memory."
+  default_prompt: "Use $grill-me-code to run scripts/grill_runner.py, generate CODE-GRILL-PACKET and CODE-GRILL-REPORT, apply config/baselines/learnings when present, verify checks, and give a ship verdict."
 policy:
   allow_implicit_invocation: true

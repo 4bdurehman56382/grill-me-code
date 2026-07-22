@@ -17,6 +17,12 @@ Risk score: **62/100**
 Proof score: **40/100**
 Ship score: **28/100**
 
+## Configuration
+
+Config: `.grill-me-code.yaml`
+Baseline: `.grill-me-code/baseline.json`
+Suppressed findings: 1
+
 ## Findings
 
 ### Blocker: SEC-001-001 - Possible hardcoded secret
@@ -30,6 +36,10 @@ Evidence: `apiToken = "live-token-value"`
 Source: `test-aware-verification`
 Location: n/a
 Evidence: n/a
+
+## Suppressed Findings
+
+- `BUG-002-003` Unresolved implementation marker in reviewed scope. (baseline) at `src/config.ts:22`
 
 ## Checks
 

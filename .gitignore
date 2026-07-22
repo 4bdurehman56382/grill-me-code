@@ -5,3 +5,4 @@ node_modules/
 *.local
 __pycache__/
 *.pyc
+.grill-me-code/
