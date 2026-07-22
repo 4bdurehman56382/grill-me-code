@@ -13,38 +13,4 @@ jobs:
         with:
           python-version: "3.12"
       - name: Validate skill shape
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          import sys
-
-          root = Path(".")
-          skill = root / "SKILL.md"
-          metadata = root / "agents" / "openai.yaml"
-
-          if not skill.exists():
-              sys.exit("SKILL.md is missing")
-          if not metadata.exists():
-              sys.exit("agents/openai.yaml is missing")
-
-          text = skill.read_text(encoding="utf-8")
-          if not text.startswith("---\n"):
-              sys.exit("SKILL.md must start with YAML frontmatter")
-          parts = text.split("---", 2)
-          if len(parts) < 3:
-              sys.exit("SKILL.md frontmatter is not closed")
-          frontmatter = parts[1]
-          if not re.search(r"^name:\s*grill-me-code\s*$", frontmatter, re.M):
-              sys.exit("frontmatter name must be grill-me-code")
-          if not re.search(r"^description:\s*.+", frontmatter, re.M):
-              sys.exit("frontmatter description is required")
-          if "[TODO" in text:
-              sys.exit("SKILL.md still contains TODO placeholders")
-
-          ui = metadata.read_text(encoding="utf-8")
-          if "Use $grill-me-code" not in ui:
-              sys.exit("agents/openai.yaml default prompt should mention $grill-me-code")
-
-          print("skill shape ok")
-          PY
+        run: python3 scripts/validate_skill.py
