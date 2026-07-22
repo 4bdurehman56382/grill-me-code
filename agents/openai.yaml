@@ -1,6 +1,6 @@
 interface:
   display_name: "Grill Me Code"
-  short_description: "Diff-aware code grilling with taint heuristics, Ponytail minimalism, checks, plugins, and memory."
-  default_prompt: "Use $grill-me-code to run scripts/grill_runner.py, generate CODE-GRILL-PACKET and CODE-GRILL-REPORT, initialize config when needed, apply config/baselines/learnings when present, compare introduced vs legacy risk, choose the right diff filter, use AST/taint/semantic/cross-file flow and Ponytail-inspired minimalism findings, scan-limit/cache evidence, test assertion proof, optional security checks, structured plugins, jury scores, verification checks, session deltas, and give a ship verdict with reasons."
+  short_description: "Production-grade code grilling with SARIF, presets, taint heuristics, minimalism, checks, and memory."
+  default_prompt: "Use $grill-me-code to run scripts/grill_runner.py, generate CODE-GRILL-PACKET and CODE-GRILL-REPORT, initialize config when needed, apply presets/config/baselines/learnings when present, use --base auto for PR-like diffs, compare introduced vs legacy risk, choose the right diff filter, use AST/taint/semantic/cross-file flow and Ponytail-inspired minimalism findings, scan-limit/cache evidence, test assertion proof, optional security checks, structured plugins, jury scores, SARIF/trend artifacts, verification checks, session deltas, and give a ship verdict with reasons."
 policy:
   allow_implicit_invocation: true

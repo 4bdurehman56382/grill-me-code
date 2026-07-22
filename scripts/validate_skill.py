@@ -72,6 +72,9 @@ def main():
     workflow = ROOT / ".github" / "workflows" / "validate.yml"
     if workflow.exists() and "scripts/validate_skill.py" not in workflow.read_text(encoding="utf-8"):
         fail("GitHub workflow should run scripts/validate_skill.py")
+    ci_template = read(ROOT / "assets" / "github-actions" / "grill-me-code.yml")
+    if "upload-sarif" not in ci_template or "--base auto" not in ci_template:
+        fail("GitHub Actions template should upload SARIF and use --base auto")
 
     for marker in ["GRILLING COMPLETE", "ISSUES FOUND", "FIX LOOP COMPLETE", "BLOCKED"]:
         if not re.search(rf"`## {re.escape(marker)}`", skill_text):
@@ -94,12 +97,16 @@ def main():
         "examples/CODE-GRILL-PACKET.sample.md",
         "examples/CODE-GRILL-REPORT.sample.md",
         "third_party/ponytail/ATTRIBUTION.md",
+        "presets/react.yaml",
+        "presets/express.yaml",
+        "presets/django.yaml",
+        "presets/flask.yaml",
         "tests/test_runner.py",
     ]:
         read(ROOT / rel)
 
     runner = read(ROOT / "scripts" / "grill_runner.py")
-    for token in ["load_config", "write_baseline", "split_suppressed_findings", "ThreadPoolExecutor", "git_changed_lines", "jury_scores", "diff_sessions", "check_plugins", "analysis_plugins", "reasoning_plugins", "javascript_semantic_findings", "python_taint_findings", "js_taint_findings", "parse_reasoning_output", "write_init_config", "since_session", "npm:audit", "minimalism_findings", "MINIMALISM_MODES", "Minimalist", "test_assertion_metrics", "cached_static_findings", "filter_scan_files", "cross_file_flow_findings", "diff_filter"]:
+    for token in ["load_config", "write_baseline", "split_suppressed_findings", "ThreadPoolExecutor", "git_changed_lines", "resolve_diff_base", "sarif_report", "append_trend", "auto_baseline_on_ship", "BUILTIN_PRESETS", "jury_scores", "diff_sessions", "check_plugins", "analysis_plugins", "reasoning_plugins", "javascript_semantic_findings", "python_taint_findings", "js_taint_findings", "parse_reasoning_output", "write_init_config", "since_session", "npm:audit", "cargo:audit", "minimalism_findings", "MINIMALISM_MODES", "Minimalist", "test_assertion_metrics", "cached_static_findings", "filter_scan_files", "cross_file_flow_findings", "diff_filter"]:
         if token not in runner:
             fail(f"grill_runner.py missing {token}")
 

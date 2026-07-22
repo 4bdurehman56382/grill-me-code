@@ -1,0 +1,19 @@
+ignore:
+  paths:
+    - dist/**
+    - build/**
+    - coverage/**
+    - node_modules/**
+test_proof:
+  mode: code
+minimalism:
+  mode: lite
+static_patterns:
+  - code: EXPRESS-001
+    severity: warning
+    regex: app\.use\s*\(\s*cors\s*\(\s*\)
+    title: Express open CORS needs an explicit trust boundary.
+  - code: EXPRESS-002
+    severity: warning
+    regex: res\.redirect\s*\([^)]*(?:req\.|request|query|params|body)
+    title: Express redirect from request input needs allow-listing.

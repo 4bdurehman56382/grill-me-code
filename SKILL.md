@@ -17,7 +17,9 @@ When no runner is available, run the grilling loop inline using this skill.
    - For a complete engine pass, run `scripts/grill_runner.py` to create packet, report, scores, state, and verdict.
    - Use runner diff mode to separate introduced risk from legacy risk when reviewing PR-like changes.
    - Use `--init` when a repo needs a starter policy file before the first serious grilling pass.
+   - Use `--base auto` for CI or PR-like diffs when the base branch is not obvious.
    - Use `--diff-filter staged` for staged-only reviews, `--diff-filter all` when both staged and worktree changes matter, and repo mode for non-git folders.
+   - Use framework presets such as `--preset react`, `--preset express`, `--preset django`, or `--preset flask` when the repo clearly matches.
    - Treat scan-limit skips, cache stats, and verdict reasons as part of the evidence.
    - Use configured analysis, check, and reasoning plugins when present; they are the only runner-level path for external SAST tools, project-specific analyzers, or LLM/expert reasoning.
    - For only a reusable artifact, run `scripts/grill_packet.py` to create `CODE-GRILL-PACKET.md`.
@@ -102,4 +104,4 @@ Keep outputs concise unless the user asks for a full artifact.
 
 ## Differentiator
 
-Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, config initialization, configurable static heuristics, Python AST checks, basic Python/JS taint-style checks, JS/TS alias and cross-file flow heuristics, command-use checks across common app languages, Ponytail-inspired minimalism checks, optional local security backends, assertion-quality test proof, scan limits, hash-based static cache, staged/worktree/all diff targeting, non-git repo fallback, diff-aware introduced-vs-legacy scoring, verdict bands/reasons, legacy risk levels, per-lens runner jury scores, structured check/analysis/reasoning plugins, GitHub annotations, baselines, learning records, GSD context bridging, fix loop, verification receipts, session comparison/delta, and a final ship/no-ship verdict.
+Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, config initialization, built-in framework presets, configurable static heuristics, Python AST checks, basic Python/JS taint-style checks, JS/TS alias and cross-file flow heuristics, command-use checks across common app languages, Ponytail-inspired minimalism checks, optional local security backends, assertion-quality test proof, scan limits, hash-based static cache, auto merge-base diff targeting, staged/worktree/all diff targeting, non-git repo fallback, diff-aware introduced-vs-legacy scoring, verdict bands/reasons, legacy risk levels, per-lens runner jury scores, structured check/analysis/reasoning plugins, GitHub annotations, SARIF, trends, baselines, learning records, GSD context bridging, fix loop, verification receipts, session comparison/delta, and a final ship/no-ship verdict.

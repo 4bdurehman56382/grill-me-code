@@ -9,6 +9,9 @@ thresholds:
   ship_with_risks_risk: 35
   min_proof_ship: 60
 
+# CLI presets can be layered before this file:
+# --preset react --preset express --preset django --preset flask
+
 test_proof:
   # code: require test proof for app/source files only
   # always: require test proof for any reviewed file

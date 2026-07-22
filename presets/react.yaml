@@ -1,0 +1,21 @@
+ignore:
+  paths:
+    - dist/**
+    - build/**
+    - coverage/**
+    - node_modules/**
+    - .next/**
+    - .nuxt/**
+test_proof:
+  mode: code
+minimalism:
+  mode: lite
+static_patterns:
+  - code: REACT-001
+    severity: warning
+    regex: dangerouslySetInnerHTML
+    title: React dangerous HTML injection needs sanitizer proof.
+  - code: REACT-002
+    severity: question
+    regex: useEffect\s*\([^,]+,\s*\[\s*\]\s*\)
+    title: Empty dependency useEffect needs proof it is intentionally one-shot.

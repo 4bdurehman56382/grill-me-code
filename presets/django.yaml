@@ -1,0 +1,19 @@
+ignore:
+  paths:
+    - staticfiles/**
+    - media/**
+    - .venv/**
+    - coverage/**
+test_proof:
+  mode: code
+minimalism:
+  mode: lite
+static_patterns:
+  - code: DJANGO-001
+    severity: blocker
+    regex: DEBUG\s*=\s*True
+    title: Django DEBUG=True must not ship to production.
+  - code: DJANGO-002
+    severity: warning
+    regex: ALLOWED_HOSTS\s*=\s*\[\s*['"]\*['"]\s*\]
+    title: Django wildcard ALLOWED_HOSTS needs deployment proof.

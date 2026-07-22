@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  security-events: write
 
 jobs:
   grill:
@@ -30,13 +31,19 @@ jobs:
         run: |
           python3 scripts/grill_runner.py \
             --mode diff \
-            --base "origin/${{ github.base_ref || 'main' }}" \
+            --base auto \
             --run-checks \
             --progress \
             --fail-on-do-not-ship
       - name: Annotate findings
         if: always()
         run: python3 scripts/github_annotations.py --session .grill-me-code/latest.json
+      - name: Upload SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .grill-me-code/CODE-GRILL.sarif
       - uses: actions/upload-artifact@v4
         if: always()
         with:

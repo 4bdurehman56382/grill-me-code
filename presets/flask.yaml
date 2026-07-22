@@ -1,0 +1,18 @@
+ignore:
+  paths:
+    - instance/**
+    - .venv/**
+    - coverage/**
+test_proof:
+  mode: code
+minimalism:
+  mode: lite
+static_patterns:
+  - code: FLASK-001
+    severity: blocker
+    regex: app\.run\s*\([^)]*debug\s*=\s*True
+    title: Flask debug mode must not ship to production.
+  - code: FLASK-002
+    severity: warning
+    regex: render_template_string\s*\(
+    title: Flask render_template_string needs template injection proof.

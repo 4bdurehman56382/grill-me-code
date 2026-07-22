@@ -21,6 +21,7 @@ from typing import Any
 from grill_packet import build_packet, git_diff_files, git_repo_files, repo_root, scoped_files
 
 
+RUNNER_ROOT = Path(__file__).resolve().parents[1]
 SEVERITY_RANK = {"nit": 1, "question": 2, "warning": 3, "blocker": 4, "blocked": 5}
 
 SOURCE_EXTENSIONS = {
@@ -122,6 +123,7 @@ TEST_PATTERNS = [
 VALID_SEVERITIES = {"blocked", "blocker", "warning", "question", "nit"}
 SUPPRESSING_OUTCOMES = {"false_positive", "accepted_risk"}
 SCANNER_CACHE_VERSION = 3
+BUILTIN_PRESETS = {"django", "express", "flask", "react"}
 
 
 @dataclass(frozen=True)
@@ -258,6 +260,8 @@ def merge_dicts(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]
     for key, value in updates.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = merge_dicts(merged[key], value)
+        elif isinstance(value, list) and isinstance(merged.get(key), list):
+            merged[key] = [*merged[key], *value]
         else:
             merged[key] = value
     return merged
@@ -344,14 +348,43 @@ def config_finding(identifier: str, title: str, evidence: str = "") -> dict[str,
     return finding
 
 
-def load_config(root: Path, explicit_path: str | None) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+def read_preset_config(root: Path, name: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "", name)
+    if not safe_name or safe_name != name:
+        return {}, [config_finding("CONFIG-PRESET-001", f"Preset name is invalid: {name}")], ""
+    candidates = [
+        root / "presets" / f"{safe_name}.yaml",
+        RUNNER_ROOT / "presets" / f"{safe_name}.yaml",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            return read_structured_config(path), [], path.name
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            return {}, [config_finding("CONFIG-PRESET-002", f"Preset could not be parsed: {name}", str(error))], ""
+    return {}, [config_finding("CONFIG-PRESET-003", f"Preset not found: {name}")], ""
+
+
+def load_config(root: Path, explicit_path: str | None, preset_names: list[str] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    merged = merge_dicts(DEFAULT_CONFIG, {})
+    findings = []
+    loaded_presets = []
+    for name in preset_names or []:
+        preset_config, preset_findings, preset_path = read_preset_config(root, name)
+        findings.extend(preset_findings)
+        if preset_config:
+            merged = merge_dicts(merged, preset_config)
+            loaded_presets.append(name)
+
     config_path = None
     if explicit_path:
         config_path = (root / explicit_path).resolve()
         try:
             config_path.relative_to(root.resolve())
         except ValueError:
-            return normalize_config(merge_dicts(DEFAULT_CONFIG, {})), [config_finding("CONFIG-001", "Config path is outside the repo", explicit_path)], ""
+            findings.append(config_finding("CONFIG-001", "Config path is outside the repo", explicit_path))
+            return normalize_config(merged), findings, ",".join(loaded_presets)
     else:
         for name in [".grill-me-code.yaml", ".grill-me-code.yml", ".grill-me-code.json"]:
             candidate = root / name
@@ -360,15 +393,17 @@ def load_config(root: Path, explicit_path: str | None) -> tuple[dict[str, Any], 
                 break
 
     if not config_path:
-        return normalize_config(merge_dicts(DEFAULT_CONFIG, {})), [], ""
+        return normalize_config(merged), findings, ",".join(loaded_presets)
     if not config_path.exists():
-        return normalize_config(merge_dicts(DEFAULT_CONFIG, {})), [config_finding("CONFIG-002", f"Config file not found: {explicit_path}")], ""
+        findings.append(config_finding("CONFIG-002", f"Config file not found: {explicit_path}"))
+        return normalize_config(merged), findings, ",".join(loaded_presets)
 
     try:
         raw_config = read_structured_config(config_path)
     except (OSError, ValueError, json.JSONDecodeError) as error:
-        return normalize_config(merge_dicts(DEFAULT_CONFIG, {})), [config_finding("CONFIG-003", f"Config file could not be parsed: {config_path.name}", str(error))], str(config_path.relative_to(root))
-    return normalize_config(merge_dicts(DEFAULT_CONFIG, raw_config)), [], str(config_path.relative_to(root))
+        findings.append(config_finding("CONFIG-003", f"Config file could not be parsed: {config_path.name}", str(error)))
+        return normalize_config(merged), findings, str(config_path.relative_to(root))
+    return normalize_config(merge_dicts(merged, raw_config)), findings, str(config_path.relative_to(root))
 
 
 def compile_static_patterns(config: dict[str, Any]) -> tuple[list[StaticPattern], list[dict[str, Any]]]:
@@ -590,6 +625,39 @@ def merge_changed_lines(items: list[dict[str, set[int]]]) -> dict[str, set[int]]
         for path, lines in item.items():
             merged.setdefault(path, set()).update(lines)
     return {path: lines for path, lines in merged.items() if lines}
+
+
+def git_output(root: Path, *args: str) -> str:
+    try:
+        return subprocess.check_output(["git", "-C", str(root), *args], text=True, stderr=subprocess.DEVNULL).strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def git_ref_exists(root: Path, ref: str) -> bool:
+    return bool(git_output(root, "rev-parse", "--verify", "--quiet", ref))
+
+
+def resolve_diff_base(root: Path, requested: str | None) -> tuple[str | None, dict[str, Any]]:
+    if requested != "auto":
+        return requested, {"requested": requested or "", "resolved": requested or "", "strategy": "explicit" if requested else "none"}
+
+    candidates = []
+    env_base = os.environ.get("GITHUB_BASE_REF") or os.environ.get("CI_MERGE_REQUEST_TARGET_BRANCH_NAME")
+    if env_base:
+        candidates.extend([f"origin/{env_base}", env_base])
+    candidates.extend(["origin/main", "origin/master", "upstream/main", "upstream/master", "main", "master"])
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if not git_ref_exists(root, candidate):
+            continue
+        merge_base = git_output(root, "merge-base", "HEAD", candidate)
+        if merge_base:
+            return merge_base, {"requested": "auto", "resolved": merge_base, "candidate": candidate, "strategy": "merge-base"}
+    return None, {"requested": "auto", "resolved": "", "strategy": "unresolved"}
 
 
 def git_diff_output(root: Path, base: str | None, diff_filter: str) -> str:
@@ -2306,9 +2374,27 @@ def discover_project_checks(root: Path, config: dict[str, Any] | None = None) ->
     if (root / "package-lock.json").exists() or (root / "npm-shrinkwrap.json").exists():
         missing = "" if npm_available else "npm lockfile found but npm is not installed"
         checks.append(make_check("npm:audit", ["npm", "audit", "--audit-level=high"], "security", "npm-lockfile", missing))
+    if (root / "pnpm-lock.yaml").exists():
+        missing = "" if shutil.which("pnpm") else "pnpm lockfile found but pnpm is not installed"
+        checks.append(make_check("pnpm:audit", ["pnpm", "audit", "--audit-level", "high"], "security", "pnpm-lockfile", missing))
+    if (root / "yarn.lock").exists():
+        missing = "" if shutil.which("yarn") else "yarn.lock found but yarn is not installed"
+        checks.append(make_check("yarn:audit", ["yarn", "npm", "audit", "--severity", "high"], "security", "yarn.lock", missing))
 
     if shutil.which("pip-audit") and any((root / name).exists() for name in ["requirements.txt", "requirements-dev.txt", "pyproject.toml", "setup.py"]):
         checks.append(make_check("pip-audit", ["pip-audit"], "security"))
+
+    if (root / "Cargo.lock").exists():
+        missing = "" if shutil.which("cargo") and shutil.which("cargo-audit") else "Cargo.lock found but cargo/cargo-audit is not installed"
+        checks.append(make_check("cargo:audit", ["cargo", "audit"], "security", "Cargo.lock", missing))
+
+    if (root / "Gemfile.lock").exists():
+        missing = "" if shutil.which("bundle-audit") else "Gemfile.lock found but bundle-audit is not installed"
+        checks.append(make_check("bundler:audit", ["bundle-audit", "check", "--update"], "security", "Gemfile.lock", missing))
+
+    if (root / "composer.lock").exists() or (root / "composer.json").exists():
+        missing = "" if shutil.which("composer") else "composer project found but composer is not installed"
+        checks.append(make_check("composer:audit", ["composer", "audit"], "security", "composer", missing))
 
     if shutil.which("gitleaks"):
         checks.append(make_check("gitleaks", ["gitleaks", "detect", "--no-banner", "--redact", "--source", "."], "security"))
@@ -2726,6 +2812,8 @@ def markdown_report(session: dict[str, Any]) -> str:
         "",
         f"Diff-aware scoring: `{score.get('diff_aware', False)}`",
         f"Diff filter: `{session.get('diff_filter', 'worktree')}`",
+        f"Diff base: `{session.get('base', {}).get('resolved') or session.get('base', {}).get('requested') or 'none'}`",
+        f"Base strategy: `{session.get('base', {}).get('strategy', 'none')}`",
         f"Changed-line files: {len(session.get('changed_lines', {}))}",
         f"Introduced findings: {score.get('introduced_findings', 0)}",
         f"Legacy findings: {score.get('legacy_findings', 0)}",
@@ -2740,9 +2828,17 @@ def markdown_report(session: dict[str, Any]) -> str:
         "## Configuration",
         "",
         f"Config: `{session.get('config_path') or 'default'}`",
+        f"Presets: `{', '.join(session.get('presets', [])) or 'none'}`",
         f"Minimalism mode: `{session.get('minimalism', {}).get('mode', 'lite')}`",
         f"Baseline: `{session.get('baseline', {}).get('path') or 'disabled'}`",
         f"Suppressed findings: {len(suppressed)}",
+        "",
+        "## Production Artifacts",
+        "",
+        f"SARIF: `{session.get('sarif', {}).get('path') or 'disabled'}`",
+        f"Trend file: `{session.get('trend', {}).get('path') or 'disabled'}`",
+        f"Trend entries: {session.get('trend', {}).get('entries', 0)}",
+        f"Previous ship score: `{session.get('trend', {}).get('previous_ship_score', '')}`",
         "",
         "## Test Proof",
         "",
@@ -2960,6 +3056,113 @@ def markdown_session_diff(diff: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def sarif_level(severity: str) -> str:
+    return {
+        "blocked": "error",
+        "blocker": "error",
+        "warning": "warning",
+        "question": "note",
+        "nit": "note",
+    }.get(severity, "note")
+
+
+def sarif_report(session: dict[str, Any]) -> dict[str, Any]:
+    rules: dict[str, dict[str, Any]] = {}
+    results = []
+    for finding in session.get("findings", []):
+        if not isinstance(finding, dict):
+            continue
+        code = str(finding.get("code") or finding_code(finding) or "CODE-GRILL")
+        rules.setdefault(code, {
+            "id": code,
+            "name": code,
+            "shortDescription": {"text": str(finding.get("title") or code)[:120]},
+            "helpUri": "https://github.com/4bdurehman56382/grill-me-code",
+            "properties": {"tags": [str(finding.get("source", "code-grill"))]},
+        })
+        result = {
+            "ruleId": code,
+            "level": sarif_level(str(finding.get("severity", "question"))),
+            "message": {"text": f"{finding.get('id', code)}: {finding.get('title', '')} {finding.get('evidence', '')}".strip()},
+            "properties": {
+                "severity": finding.get("severity", "question"),
+                "source": finding.get("source", "unknown"),
+                "diff_status": finding.get("diff_status", "scope"),
+                "fingerprint": finding.get("fingerprint", ""),
+            },
+        }
+        if finding.get("file"):
+            region = {"startLine": max(1, int(finding.get("line") or 1))}
+            result["locations"] = [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": str(finding.get("file", "")).replace("\\", "/")},
+                    "region": region,
+                }
+            }]
+        results.append(result)
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "grill-me-code",
+                    "informationUri": "https://github.com/4bdurehman56382/grill-me-code",
+                    "rules": sorted(rules.values(), key=lambda item: item["id"]),
+                }
+            },
+            "results": results,
+            "invocations": [{
+                "executionSuccessful": session.get("score", {}).get("verdict") not in {"BLOCKED"},
+                "properties": {
+                    "session_id": session.get("session_id", ""),
+                    "verdict": session.get("score", {}).get("verdict", ""),
+                },
+            }],
+        }],
+    }
+
+
+def session_trend_metric(session: dict[str, Any]) -> dict[str, Any]:
+    score = session.get("score", {})
+    checks = session.get("checks", {})
+    findings = session.get("findings", [])
+    return {
+        "generated": session.get("generated", ""),
+        "session_id": session.get("session_id", ""),
+        "mode": session.get("mode", ""),
+        "verdict": score.get("verdict", ""),
+        "risk_score": score.get("risk_score", 0),
+        "proof_score": score.get("proof_score", 0),
+        "ship_score": score.get("ship_score", 0),
+        "findings": len(findings),
+        "introduced_findings": score.get("introduced_findings", 0),
+        "legacy_findings": score.get("legacy_findings", 0),
+        "failed_checks": score.get("failed_checks", 0),
+        "passed_checks": score.get("passed_checks", 0),
+        "checks_run": len(checks.get("results", [])) if isinstance(checks, dict) else 0,
+    }
+
+
+def append_trend(path: Path, session: dict[str, Any], limit: int = 200) -> dict[str, Any]:
+    data = read_json(path)
+    entries = data.get("entries") if isinstance(data, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+    metric = session_trend_metric(session)
+    previous = entries[-1] if entries else {}
+    entries.append(metric)
+    entries = entries[-limit:]
+    write_json(path, {"version": 1, "updated": utc_now(), "entries": entries})
+    return {
+        "path": str(path),
+        "entries": len(entries),
+        "previous_verdict": previous.get("verdict", ""),
+        "previous_ship_score": previous.get("ship_score", ""),
+        "current_ship_score": metric.get("ship_score", 0),
+    }
+
+
 def language_label(path: Path) -> str:
     labels = {
         ".py": "Python",
@@ -3095,16 +3298,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--force-init", action="store_true", help="Allow --init to overwrite the target config file.")
     parser.add_argument("--mode", choices=["plan", "diff", "repo", "release", "fix", "scope"], default="diff")
     parser.add_argument("--depth", choices=["quick", "standard", "deep"], default="standard")
-    parser.add_argument("--base", help="Optional git diff base, such as origin/main")
+    parser.add_argument("--base", help="Optional git diff base, such as origin/main, or auto to use git merge-base.")
     parser.add_argument("--diff-filter", choices=["worktree", "staged", "all"], default="worktree", help="Diff source for mode=diff.")
     parser.add_argument("--scope", action="append", default=[], help="Comma-separated file paths. Can be repeated.")
     parser.add_argument("--max-files", type=int, default=60)
     parser.add_argument("--plan", help="Optional design/plan file to cross-reference with scoped files.")
     parser.add_argument("--config", help="Optional .grill-me-code YAML/JSON config file.")
+    parser.add_argument("--preset", action="append", choices=sorted(BUILTIN_PRESETS), default=[], help="Apply a built-in policy preset. Can be repeated.")
     parser.add_argument("--minimalism", choices=["off", "lite", "full", "ultra"], help="Override the Ponytail-inspired minimalism scan mode.")
     parser.add_argument("--baseline", default=".grill-me-code/baseline.json", help="Baseline file used to suppress known findings.")
     parser.add_argument("--no-baseline", action="store_true", help="Do not read the baseline file even if it exists.")
     parser.add_argument("--write-baseline", action="store_true", help="Write or update the baseline with current findings.")
+    parser.add_argument("--auto-baseline-on-ship", action="store_true", help="Write/update the baseline automatically when the final verdict is SHIP.")
     parser.add_argument("--learning-store", default=".grill-me-code/learnings.json", help="Learning outcomes file used for suppression.")
     parser.add_argument("--since-session", help="Compare the new run against a previous session JSON and attach the delta.")
     parser.add_argument("--gsd-phase", help="Optional GSD phase prefix to include from .planning/phases.")
@@ -3116,6 +3321,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--jobs", type=int, default=max(1, min(8, os.cpu_count() or 1)), help="Parallel syntax-check worker count.")
     parser.add_argument("--progress", action="store_true", help="Print incremental progress to stderr while checks run.")
     parser.add_argument("--output-dir", default=".grill-me-code")
+    parser.add_argument("--sarif-path", help="Write SARIF output to this path. Defaults to <output-dir>/CODE-GRILL.sarif.")
+    parser.add_argument("--no-sarif", action="store_true", help="Disable SARIF output.")
+    parser.add_argument("--trend-file", help="Append run metrics to this JSON file. Defaults to <output-dir>/trends.json.")
+    parser.add_argument("--no-trend", action="store_true", help="Disable trend metrics output.")
     parser.add_argument("--session-id", help="Stable session id for resume/re-run.")
     parser.add_argument("--fail-on-do-not-ship", action="store_true")
     return parser.parse_args(argv)
@@ -3158,7 +3367,9 @@ def main(argv: list[str]) -> int:
         print("--jobs must be a positive integer.", file=sys.stderr)
         return 2
 
-    config, config_findings, config_path = load_config(root, args.config)
+    effective_base, base_info = resolve_diff_base(root, args.base)
+    args.base = effective_base
+    config, config_findings, config_path = load_config(root, args.config, args.preset)
     static_patterns, pattern_config_findings = compile_static_patterns(config)
     _, check_config_findings = configured_check_plugins(config)
     analysis_plugins, analysis_config_findings = configured_command_plugins(config, "analysis_plugins", "analysis")
@@ -3176,6 +3387,8 @@ def main(argv: list[str]) -> int:
     sessions_dir = out_dir / "sessions"
     packet_path = out_dir / "CODE-GRILL-PACKET.md"
     report_path = out_dir / "CODE-GRILL-REPORT.md"
+    sarif_path = (root / args.sarif_path).resolve() if args.sarif_path else out_dir / "CODE-GRILL.sarif"
+    trend_path = (root / args.trend_file).resolve() if args.trend_file else out_dir / "trends.json"
     baseline_path = (root / args.baseline).resolve()
     learning_path = (root / args.learning_store).resolve()
     cache_path = (root / args.cache_file).resolve() if args.cache_file else out_dir / "cache.json"
@@ -3242,6 +3455,7 @@ def main(argv: list[str]) -> int:
 
     baseline_findings = []
     baseline_was_read = False
+    baseline_can_write = False
     if not args.no_baseline:
         try:
             baseline_path.relative_to(root.resolve())
@@ -3249,6 +3463,7 @@ def main(argv: list[str]) -> int:
             raw_findings.append(config_finding("BASELINE-001", "Baseline path is outside the repo", args.baseline))
             baseline = {"version": 1, "findings": []}
         else:
+            baseline_can_write = True
             baseline_was_read = baseline_path.exists()
             baseline = load_baseline(baseline_path, True)
             baseline_findings = baseline.get("findings", [])
@@ -3256,8 +3471,11 @@ def main(argv: list[str]) -> int:
         baseline = {"version": 1, "findings": []}
     learnings = load_learnings(learning_path)
     findings, suppressed_findings = split_suppressed_findings(annotate_findings(raw_findings), config, baseline, learnings)
-    if args.write_baseline and not args.no_baseline:
+    baseline_written = False
+    baseline_auto_written = False
+    if args.write_baseline and baseline_can_write:
         write_baseline(baseline_path, raw_findings, baseline)
+        baseline_written = True
         emit_progress(args.progress, f"updated baseline at {display_path(baseline_path, root)}")
 
     syntax_results = run_syntax_checks(root, files, min(args.timeout, 30), args.jobs, args.progress)
@@ -3274,6 +3492,8 @@ def main(argv: list[str]) -> int:
         "mode": mode,
         "depth": args.depth,
         "config_path": config_path,
+        "presets": args.preset,
+        "base": base_info,
         "diff_filter": args.diff_filter,
         "files": [str(path.relative_to(root)) for path in files],
         "skipped_files": skipped_files,
@@ -3307,13 +3527,23 @@ def main(argv: list[str]) -> int:
         "baseline": {
             "path": "" if args.no_baseline else display_path(baseline_path, root),
             "read": baseline_was_read,
-            "written": bool(args.write_baseline and not args.no_baseline),
+            "written": baseline_written,
+            "auto_written": baseline_auto_written,
             "findings": len(baseline_findings),
         },
         "learning_store": display_path(learning_path, root),
         "gsd": gsd,
         "score": score,
         "jury_scores": jury,
+        "sarif": {
+            "enabled": not args.no_sarif,
+            "path": "" if args.no_sarif else display_path(sarif_path, root),
+        },
+        "trend": {
+            "enabled": not args.no_trend,
+            "path": "" if args.no_trend else display_path(trend_path, root),
+            "entries": 0,
+        },
     }
 
     reasoning_outputs, reasoning_findings = run_reasoning_plugins(root, reasoning_plugins, session, min(args.timeout, 120), args.progress)
@@ -3330,6 +3560,14 @@ def main(argv: list[str]) -> int:
             session["jury_scores"] = jury
         session["reasoning"] = reasoning_outputs
 
+    if args.auto_baseline_on_ship and baseline_can_write and session["score"]["verdict"] == "SHIP":
+        write_baseline(baseline_path, raw_findings, baseline)
+        baseline_written = True
+        baseline_auto_written = True
+        session["baseline"]["written"] = True
+        session["baseline"]["auto_written"] = True
+        emit_progress(args.progress, f"auto-updated baseline at {display_path(baseline_path, root)}")
+
     if args.since_session:
         since_path = Path(args.since_session)
         if not since_path.is_absolute():
@@ -3345,7 +3583,14 @@ def main(argv: list[str]) -> int:
             session["session_delta"] = delta
             (out_dir / "CODE-GRILL-SESSION-DIFF.md").write_text(markdown_session_diff(delta), encoding="utf-8")
 
+    if not args.no_trend:
+        trend_info = append_trend(trend_path, session)
+        trend_info["path"] = display_path(trend_path, root)
+        session["trend"] = {"enabled": True, **trend_info}
+
     report_path.write_text(markdown_report(session), encoding="utf-8")
+    if not args.no_sarif:
+        write_json(sarif_path, sarif_report(session))
     if cache_enabled:
         write_json(cache_path, scan_cache)
     write_json(sessions_dir / f"{session_id}.json", session)

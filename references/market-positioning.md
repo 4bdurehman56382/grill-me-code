@@ -19,6 +19,8 @@ The gap: developers also need a local, forkable, agent-native workflow that:
 
 - grills the plan before bad code exists
 - produces a review packet without waiting for a PR
+- ships CI-friendly SARIF, annotations, and trend artifacts instead of only Markdown
+- starts quickly with framework presets instead of making every team tune policy from zero
 - forces proof that tests cover the risky behavior
 - checks rollback, wiring, migration, auth, and observability
 - works in repo mode even outside git, while still supporting staged/worktree/all diff targeting inside git
@@ -55,7 +57,7 @@ A generated markdown artifact containing scope, risk lenses, hard questions, pro
 
 ### CODE-GRILL Runner
 
-A minimal-dependency CLI that resolves scope, runs configurable static heuristics plus targeted Python AST checks, basic Python/JS taint-style reaching-definition checks, JS/TS alias heuristics, command-use checks for Go/Rust/Kotlin/Swift/Dart/Java/C#/PHP, Ponytail-inspired minimalism heuristics, and lightweight JS/TS cross-file flow signals, discovers project checks, security backends, and check plugins, optionally runs those checks, separates setup-blocked findings from code risk, separates introduced risk from legacy risk, assigns risk/proof/ship scores plus bands/reasons, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
+A minimal-dependency CLI that resolves scope, auto-resolves git merge bases, runs configurable static heuristics plus targeted Python AST checks, basic Python/JS taint-style reaching-definition checks, JS/TS alias heuristics, command-use checks for Go/Rust/Kotlin/Swift/Dart/Java/C#/PHP, Ponytail-inspired minimalism heuristics, and lightweight JS/TS cross-file flow signals, discovers project checks, security backends, and check plugins, optionally runs those checks, separates setup-blocked findings from code risk, separates introduced risk from legacy risk, assigns risk/proof/ship scores plus bands/reasons, persists session JSON, writes SARIF/trend artifacts, and writes `CODE-GRILL-REPORT.md`.
 
 It should remain honest: built-in scanning is useful pressure, not full call-graph taint analysis or a replacement for CodeQL/Semgrep/language-native SAST. Deep analysis belongs in analysis plugins, reasoning plugins, or project checks.
 
@@ -82,6 +84,10 @@ The runner can run Ponytail-inspired `lite`, `full`, or `ultra` minimalism passe
 ### Scale Guardrails
 
 Large files are skipped with explicit findings instead of being fully loaded into memory. Static findings can be cached by file hash and scanner signature so repeated local runs do not rescan unchanged files.
+
+### Production Outputs
+
+The runner writes SARIF for code scanning, GitHub Actions annotations for PR feedback, trend metrics for score history, and session JSON for agent/human resume. `--base auto` computes a merge-base when CI or branch context is available. `--auto-baseline-on-ship` lets main-branch clean runs refresh the accepted baseline without suppressing risky runs.
 
 ### Policy Memory
 

@@ -335,6 +335,15 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual(path, ".grill-me-code.json")
             self.assertEqual(config["thresholds"]["ship_with_risks_risk"], 45)
 
+    def test_preset_loading_adds_framework_patterns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config, findings, path = grill_runner.load_config(root, None, ["django"])
+            patterns, pattern_findings = grill_runner.compile_static_patterns(config)
+            self.assertEqual(findings + pattern_findings, [])
+            self.assertEqual(path, "django")
+            self.assertTrue(any(pattern.code == "DJANGO-001" for pattern in patterns))
+
     def test_baseline_suppresses_fingerprint(self):
         finding = {
             "id": "SEC-001-001",
@@ -420,6 +429,15 @@ class GrillRunnerTests(unittest.TestCase):
             checks = grill_runner.discover_project_checks(root)
             npm_audit = next(item for item in checks if item["name"] == "npm:audit")
             self.assertEqual(npm_audit["kind"], "security")
+
+    def test_discover_project_checks_adds_broader_dependency_audits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Cargo.lock").write_text("", encoding="utf-8")
+            (root / "composer.lock").write_text("{}", encoding="utf-8")
+            names = [item["name"] for item in grill_runner.discover_project_checks(root)]
+            self.assertIn("cargo:audit", names)
+            self.assertIn("composer:audit", names)
 
     def test_discover_project_checks_makefile_and_plugin_missing_health(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -589,6 +607,43 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual(session["minimalism"]["mode"], "lite")
             self.assertTrue(any(finding["code"] == "MIN-001" for finding in session["findings"]))
 
+    def test_runner_writes_sarif_and_trend_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = grill_runner.main(["--scope", "app.py", "--output-dir", ".out"])
+            finally:
+                os.chdir(old_cwd)
+            session = json.loads((root / ".out" / "latest.json").read_text(encoding="utf-8"))
+            sarif = json.loads((root / ".out" / "CODE-GRILL.sarif").read_text(encoding="utf-8"))
+            trends = json.loads((root / ".out" / "trends.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual(sarif["version"], "2.1.0")
+            self.assertEqual(trends["entries"][0]["session_id"], session["session_id"])
+            self.assertEqual(session["trend"]["entries"], 1)
+
+    def test_runner_auto_baseline_on_ship(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "test_app.py").write_text("def test_ok():\n    assert 1 == 1\n", encoding="utf-8")
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = grill_runner.main(["--scope", "app.py,test_app.py", "--output-dir", ".out", "--auto-baseline-on-ship"])
+            finally:
+                os.chdir(old_cwd)
+            session = json.loads((root / ".out" / "latest.json").read_text(encoding="utf-8"))
+            baseline = json.loads((root / ".grill-me-code" / "baseline.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertTrue(session["baseline"]["auto_written"])
+            self.assertEqual(baseline["version"], 1)
+
     def test_runner_fail_on_do_not_ship_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -661,6 +716,23 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual(score["legacy_blockers"], 1)
             self.assertEqual(score["verdict"], "DO NOT SHIP")
 
+    def test_resolve_diff_base_auto_uses_merge_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.check_call(["git", "init", "-b", "main"], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=root)
+            subprocess.check_call(["git", "config", "user.name", "Test"], cwd=root)
+            (root / "app.py").write_text("print('base')\n", encoding="utf-8")
+            subprocess.check_call(["git", "add", "app.py"], cwd=root)
+            subprocess.check_call(["git", "commit", "-m", "base"], cwd=root, stdout=subprocess.DEVNULL)
+            expected = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            subprocess.check_call(["git", "checkout", "-b", "feature"], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            (root / "app.py").write_text("print('feature')\n", encoding="utf-8")
+            subprocess.check_call(["git", "commit", "-am", "feature"], cwd=root, stdout=subprocess.DEVNULL)
+            resolved, info = grill_runner.resolve_diff_base(root, "auto")
+            self.assertEqual(resolved, expected)
+            self.assertEqual(info["strategy"], "merge-base")
+
     def test_diff_aware_legacy_blocker_is_ship_with_risks(self):
         finding = {"id": "SEC-001-001", "severity": "blocker", "diff_status": "legacy"}
         score = grill_runner.score_session([Path("app.py")], [finding], [], test_files=1, code_files=1, diff_aware=True)
@@ -688,6 +760,13 @@ class GrillRunnerTests(unittest.TestCase):
         self.assertEqual(len(diff["added"]), 1)
         self.assertEqual(len(diff["resolved"]), 1)
         self.assertIn("CODE-GRILL-SESSION-DIFF", grill_runner.markdown_session_diff(diff))
+
+    def test_sarif_report_maps_findings_to_results(self):
+        finding = {"id": "SEC-001-001", "code": "SEC-001", "severity": "blocker", "file": "app.py", "line": 3, "title": "Danger", "source": "test"}
+        session = {"session_id": "s", "score": {"verdict": "DO NOT SHIP"}, "findings": [finding]}
+        sarif = grill_runner.sarif_report(session)
+        self.assertEqual(sarif["runs"][0]["results"][0]["level"], "error")
+        self.assertEqual(sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"], "app.py")
 
     def test_runner_since_session_attaches_delta(self):
         with tempfile.TemporaryDirectory() as tmp:

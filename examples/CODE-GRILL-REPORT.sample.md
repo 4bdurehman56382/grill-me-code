@@ -41,6 +41,8 @@ Skipped files: 1
 
 Diff-aware scoring: `true`
 Diff filter: `worktree`
+Diff base: `abc123mergebase`
+Base strategy: `merge-base`
 Changed-line files: 2
 Introduced findings: 2
 Legacy findings: 1
@@ -55,9 +57,17 @@ Misses: 2
 ## Configuration
 
 Config: `.grill-me-code.yaml`
+Presets: `react, express`
 Minimalism mode: `full`
 Baseline: `.grill-me-code/baseline.json`
 Suppressed findings: 1
+
+## Production Artifacts
+
+SARIF: `.grill-me-code/CODE-GRILL.sarif`
+Trend file: `.grill-me-code/trends.json`
+Trend entries: 12
+Previous ship score: `71`
 
 ## Test Proof
 
