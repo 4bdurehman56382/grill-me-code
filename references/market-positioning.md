@@ -25,6 +25,8 @@ The gap: developers also need a local, forkable, agent-native workflow that:
 - keeps artifacts that humans and agents can resume
 - runs available local checks instead of only describing them
 - lets teams tune policy with config, baselines, suppressions, and severity overrides
+- separates introduced risk from legacy risk during diff reviews
+- scores the same scope through explicit runner-backed jury lenses
 - records finding outcomes so the team can learn which grills catch real bugs
 
 ## High-End Product Promise
@@ -47,11 +49,15 @@ A generated markdown artifact containing scope, risk lenses, hard questions, pro
 
 ### CODE-GRILL Runner
 
-A dependency-free CLI that resolves scope, runs configurable static heuristics, discovers project checks, optionally runs those checks, separates setup-blocked findings from code risk, assigns risk/proof/ship scores, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
+A minimal-dependency CLI that resolves scope, runs configurable static heuristics plus targeted Python AST checks, discovers project checks and check plugins, optionally runs those checks, separates setup-blocked findings from code risk, separates introduced risk from legacy risk, assigns risk/proof/ship scores, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
 
 ### Policy Memory
 
 Baselines and learning records let teams suppress accepted findings by stable fingerprints while still surfacing new evidence.
+
+### Session Compare
+
+Saved sessions can be diffed to show added, resolved, and persisting findings between runs.
 
 ### Jury Mode
 
@@ -63,6 +69,8 @@ The same scope is reviewed through distinct lenses:
 - Refactorer: what contract might break?
 - Release Captain: what blocks ship?
 - Maintainer: what will be confusing later?
+
+The runner gives each lens its own score and verdict. LLM-based grilling should use those scores as evidence, then add human-grade reasoning where the script cannot infer intent.
 
 ### Fix Receipts
 

@@ -5,6 +5,8 @@ import contextlib
 import io
 import json
 import os
+import re
+import subprocess
 import unittest
 
 
@@ -53,6 +55,27 @@ class GrillRunnerTests(unittest.TestCase):
             findings = grill_runner.static_findings(root, [source])
             self.assertEqual(findings[0]["code"], "SEC-005")
 
+    def test_python_ast_detects_os_system_and_ignores_comment_eval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "danger.py"
+            source.write_text("# eval(user_input)\nimport os\nos.system(user_input)\n", encoding="utf-8")
+            findings = grill_runner.static_findings(root, [source])
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["code"], "SEC-012")
+            self.assertEqual(findings[0]["source"], "python-ast")
+
+    def test_rule_priority_combines_same_line_highest_severity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "danger.py"
+            source.write_text("eval(user_input)\n", encoding="utf-8")
+            custom = grill_runner.StaticPattern("warning", "TEAM-001", re.compile(r"eval\("), "Team eval rule")
+            findings = grill_runner.static_findings(root, [source], [custom, *grill_runner.BUILTIN_STATIC_PATTERNS])
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["severity"], "blocker")
+            self.assertIn("TEAM-001", findings[0]["matched_codes"])
+
     def test_custom_config_pattern_and_suppression(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -79,24 +102,14 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual([finding["code"] for finding in active], ["TEAM-001"])
             self.assertEqual([finding["code"] for finding in suppressed], ["BUG-002"])
 
-    def test_simple_yaml_load_handles_nested_config(self):
-        data = grill_runner.simple_yaml_load(
-            "\n".join([
-                "thresholds:",
-                "  severity_weights:",
-                "    blocker: 40",
-                "ignore:",
-                "  paths:",
-                "    - examples/**",
-                "static_patterns:",
-                "  - code: TEAM-001",
-                "    severity: warning",
-                "    regex: dangerousCall\\(",
-            ])
-        )
-        self.assertEqual(data["thresholds"]["severity_weights"]["blocker"], 40)
-        self.assertEqual(data["ignore"]["paths"], ["examples/**"])
-        self.assertEqual(data["static_patterns"][0]["code"], "TEAM-001")
+    def test_json_config_loading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".grill-me-code.json").write_text(json.dumps({"thresholds": {"ship_with_risks_risk": 45}}), encoding="utf-8")
+            config, findings, path = grill_runner.load_config(root, None)
+            self.assertEqual(findings, [])
+            self.assertEqual(path, ".grill-me-code.json")
+            self.assertEqual(config["thresholds"]["ship_with_risks_risk"], 45)
 
     def test_baseline_suppresses_fingerprint(self):
         finding = {
@@ -169,6 +182,21 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertIn("npm:lint", names)
             self.assertIn("npm:test", names)
 
+    def test_discover_project_checks_makefile_and_plugin_missing_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Makefile").write_text("test:\n\ttrue\n", encoding="utf-8")
+            config = grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {
+                "check_plugins": [{"name": "missing-tool", "command": ["definitely-missing-grill-tool"], "kind": "test"}],
+            }))
+            checks = grill_runner.discover_project_checks(root, config)
+            names = [item["name"] for item in checks]
+            self.assertIn("make:test", names)
+            self.assertIn("missing-tool", names)
+            health = grill_runner.check_health_findings(root, checks)
+            self.assertEqual(health[0]["severity"], "question")
+            self.assertIn("missing-tool", health[0]["title"])
+
     def test_run_project_checks_records_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -182,6 +210,17 @@ class GrillRunnerTests(unittest.TestCase):
             root = Path(tmp)
             result = grill_runner.run_command([sys.executable, "-c", "import time; time.sleep(2)"], root, timeout=1)
             self.assertTrue(result["timed_out"])
+
+    def test_run_syntax_checks_parallel_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = root / "good.py"
+            bad = root / "bad.py"
+            good.write_text("print('ok')\n", encoding="utf-8")
+            bad.write_text("def broken(:\n", encoding="utf-8")
+            results = grill_runner.run_syntax_checks(root, [good, bad], timeout=5, jobs=2)
+            self.assertEqual(len(results), 2)
+            self.assertEqual(sum(1 for result in results if not result["ok"]), 1)
 
     def test_build_packet_output_contains_scope_table(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -249,6 +288,52 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual(session["findings"], [])
             self.assertEqual(len(session["suppressed_findings"]), 1)
             self.assertEqual(session["suppressed_findings"][0]["suppressed_by"], "baseline")
+
+    def test_git_changed_lines_and_diff_aware_scoring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.check_call(["git", "init", "-b", "main"], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=root)
+            subprocess.check_call(["git", "config", "user.name", "Test"], cwd=root)
+            source = root / "app.py"
+            source.write_text("eval(old_input)\nprint('safe')\n", encoding="utf-8")
+            subprocess.check_call(["git", "add", "app.py"], cwd=root)
+            subprocess.check_call(["git", "commit", "-m", "base"], cwd=root, stdout=subprocess.DEVNULL)
+            source.write_text("eval(old_input)\nos.system(user_input)\n", encoding="utf-8")
+            changed = grill_runner.git_changed_lines(root, None)
+            findings = grill_runner.annotate_diff_status(grill_runner.static_findings(root, [source]), changed)
+            score = grill_runner.score_session([source], findings, [], test_files=1, code_files=1, diff_aware=True)
+            statuses = {finding["line"]: finding["diff_status"] for finding in findings}
+            self.assertEqual(statuses[1], "legacy")
+            self.assertEqual(statuses[2], "introduced")
+            self.assertEqual(score["introduced_blockers"], 1)
+            self.assertEqual(score["legacy_blockers"], 1)
+            self.assertEqual(score["verdict"], "DO NOT SHIP")
+
+    def test_diff_aware_legacy_blocker_is_ship_with_risks(self):
+        finding = {"id": "SEC-001-001", "severity": "blocker", "diff_status": "legacy"}
+        score = grill_runner.score_session([Path("app.py")], [finding], [], test_files=1, code_files=1, diff_aware=True)
+        self.assertEqual(score["legacy_blockers"], 1)
+        self.assertEqual(score["introduced_blockers"], 0)
+        self.assertEqual(score["verdict"], "SHIP WITH RISKS")
+
+    def test_jury_scores_security_lens(self):
+        findings = [{"id": "SEC-001-001", "code": "SEC-001", "severity": "blocker", "source": "python-ast"}]
+        jury = grill_runner.jury_scores(findings, [], grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {})))
+        self.assertEqual(jury["Security"]["verdict"], "DO NOT SHIP")
+        self.assertEqual(jury["Security"]["findings"], 1)
+
+    def test_session_diff_added_and_resolved(self):
+        old = {"session_id": "old", "score": {"verdict": "DO NOT SHIP"}, "findings": [{"id": "A-001", "fingerprint": "old", "title": "old"}]}
+        new = {"session_id": "new", "score": {"verdict": "SHIP"}, "findings": [{"id": "B-001", "fingerprint": "new", "title": "new"}]}
+        diff = grill_runner.diff_sessions(old, new)
+        self.assertEqual(len(diff["added"]), 1)
+        self.assertEqual(len(diff["resolved"]), 1)
+        self.assertIn("CODE-GRILL-SESSION-DIFF", grill_runner.markdown_session_diff(diff))
+
+    def test_plan_mentions_file_requires_bounded_filename_match(self):
+        self.assertFalse(grill_runner.plan_mentions_file("we need to test this", "src/test.py", "test.py"))
+        self.assertTrue(grill_runner.plan_mentions_file("touch `src/test.py`", "src/test.py", "test.py"))
 
     def test_grill_learn_verifies_session_finding_and_stores_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:

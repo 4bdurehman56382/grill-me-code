@@ -83,6 +83,9 @@ def main():
 
     for rel in [
         ".grill-me-code.example.yaml",
+        "requirements.txt",
+        "calibration/cases.json",
+        "scripts/calibrate_scores.py",
         "scripts/grill_runner.py",
         "scripts/grill_learn.py",
         "assets/github-actions/grill-me-code.yml",
@@ -93,7 +96,7 @@ def main():
         read(ROOT / rel)
 
     runner = read(ROOT / "scripts" / "grill_runner.py")
-    for token in ["load_config", "write_baseline", "split_suppressed_findings", "ThreadPoolExecutor"]:
+    for token in ["load_config", "write_baseline", "split_suppressed_findings", "ThreadPoolExecutor", "git_changed_lines", "jury_scores", "diff_sessions", "check_plugins"]:
         if token not in runner:
             fail(f"grill_runner.py missing {token}")
 

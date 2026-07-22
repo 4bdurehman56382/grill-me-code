@@ -1,0 +1,41 @@
+[
+  {
+    "name": "clean-tested-change",
+    "findings": [],
+    "test_files": 1,
+    "code_files": 1,
+    "checks": [{"ok": true, "kind": "test"}],
+    "expected_verdict": "SHIP"
+  },
+  {
+    "name": "introduced-eval-blocker",
+    "findings": [{"id": "SEC-001-001", "severity": "blocker", "diff_status": "introduced"}],
+    "test_files": 1,
+    "code_files": 1,
+    "diff_aware": true,
+    "expected_verdict": "DO NOT SHIP"
+  },
+  {
+    "name": "missing-plan-config-block",
+    "findings": [{"id": "PLAN-002", "severity": "blocked", "diff_status": "scope"}],
+    "test_files": 1,
+    "code_files": 1,
+    "expected_verdict": "BLOCKED"
+  },
+  {
+    "name": "legacy-blocker-only",
+    "findings": [{"id": "SEC-001-001", "severity": "blocker", "diff_status": "legacy"}],
+    "test_files": 1,
+    "code_files": 1,
+    "diff_aware": true,
+    "expected_verdict": "SHIP WITH RISKS"
+  },
+  {
+    "name": "warning-without-proof",
+    "findings": [{"id": "TEST-PROOF-001", "severity": "warning", "diff_status": "scope"}],
+    "test_files": 0,
+    "code_files": 1,
+    "checks": [],
+    "expected_verdict": "SHIP WITH RISKS"
+  }
+]

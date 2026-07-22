@@ -2,6 +2,8 @@
 
 Use this when the user asks for a deeper grill, cross-functional review, or market-grade differentiation.
 
+When `scripts/grill_runner.py` is available, use its `jury_scores` output as the factual floor for Jury Mode. The LLM layer may add reasoning and edge-case questions, but it must not claim a lens has been tool-verified unless the runner, project checks, or another real tool produced evidence.
+
 ## Lenses
 
 ### Breaker

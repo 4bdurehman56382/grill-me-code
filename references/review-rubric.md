@@ -31,6 +31,8 @@ Use this precedence:
 
 Filter out generated files, vendored dependencies, lockfiles, build outputs, and planning artifacts unless the user explicitly asks to inspect them.
 
+In diff or PR-like reviews, distinguish introduced risk from legacy risk. A pre-existing blocker in a changed file should be reported, but it should not be described as introduced by the current diff unless the changed line map proves it.
+
 If the scope is too large, split it:
 
 - changed behavior

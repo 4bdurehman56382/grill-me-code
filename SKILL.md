@@ -15,6 +15,7 @@ When no runner is available, run the grilling loop inline using this skill.
    - Otherwise use the current git diff.
    - If the user asks for repo-wide grilling, sample architecture first, then inspect hot paths.
    - For a complete engine pass, run `scripts/grill_runner.py` to create packet, report, scores, state, and verdict.
+   - Use runner diff mode to separate introduced risk from legacy risk when reviewing PR-like changes.
    - For only a reusable artifact, run `scripts/grill_packet.py` to create `CODE-GRILL-PACKET.md`.
    - If the runner script is unavailable or cannot execute in the current environment, say that plainly and fall back to inline review. Do not claim tool-backed checks, scores, or receipts that were not actually produced.
    - Fail closed on unclear destructive or production-impacting actions.
@@ -94,4 +95,4 @@ Keep outputs concise unless the user asks for a full artifact.
 
 ## Differentiator
 
-Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, configurable static heuristics, available-tool checks, baselines, learning records, GSD context bridging, fix loop, verification receipts, and a final ship/no-ship verdict.
+Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, configurable static heuristics, Python AST checks for key hazards, diff-aware introduced-vs-legacy scoring, per-lens runner jury scores, configurable check plugins, baselines, learning records, GSD context bridging, fix loop, verification receipts, session comparison, and a final ship/no-ship verdict.

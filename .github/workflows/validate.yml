@@ -12,10 +12,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install optional parser dependency
+        run: python3 -m pip install -r requirements.txt
       - name: Validate skill shape
         run: python3 scripts/validate_skill.py
       - name: Run unit tests
         run: python3 -m unittest discover -s tests
+      - name: Check scoring calibration
+        run: python3 scripts/calibrate_scores.py
       - name: Smoke-test packet generator
         run: |
           python3 scripts/grill_packet.py --mode repo --max-files 8 --output /tmp/CODE-GRILL-PACKET.md

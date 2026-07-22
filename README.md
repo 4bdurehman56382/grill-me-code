@@ -2,7 +2,7 @@
 
 `grill-me-code` is a Codex skill for hard technical review, refactor coordination, and code-focused grilling. It keeps the original hot-seat theme, but turns it into a high-end engineering workflow for code, diffs, plans, architecture, tests, releases, and fix loops.
 
-It is designed to be forkable: dependency-free runner scripts, stable markdown/JSON artifacts, configurable static patterns, baselines/suppressions, optional GSD context bridging, and machine-readable verdict markers.
+It is designed to be forkable: runner scripts with minimal dependencies, stable markdown/JSON artifacts, configurable static patterns, baselines/suppressions, optional GSD context bridging, and machine-readable verdict markers.
 
 ## Use Cases
 
@@ -19,7 +19,9 @@ It is designed to be forkable: dependency-free runner scripts, stable markdown/J
 - **Runner engine:** scope resolution -> packet -> static findings -> project checks -> scoring -> persisted report.
 - **Config file:** `.grill-me-code.yaml`, `.grill-me-code.yml`, or `.grill-me-code.json` can tune thresholds, severity overrides, suppressions, and custom static patterns.
 - **Baselines and learnings:** known accepted findings can be suppressed by stable fingerprints instead of reappearing forever.
-- **Jury Mode:** Breaker, Security, Tester, Refactorer, Release Captain, and Maintainer lenses.
+- **Diff-aware scoring:** diff mode separates introduced findings from legacy findings in changed files.
+- **Runner Jury Mode:** Breaker, Security, Tester, Refactorer, Release Captain, and Maintainer each get a per-lens score.
+- **Check plugins:** teams can register extra commands without editing the runner.
 - **Fix Receipts:** every fix should include files changed, verification command, result, and remaining risk.
 - **Ship Verdict:** `SHIP`, `SHIP WITH RISKS`, `DO NOT SHIP`, or `BLOCKED`.
 - **Pre-code grilling:** interrogates plans before code exists, not just PRs after the damage is done.
@@ -39,6 +41,12 @@ Depending on your Codex setup, `~/.codex/skills` may be the preferred skills dir
 ```bash
 mkdir -p ~/.codex/skills
 git clone https://github.com/4bdurehman56382/grill-me-code ~/.codex/skills/grill-me-code
+```
+
+YAML config files require PyYAML. JSON config files work without extra packages.
+
+```bash
+python3 -m pip install -r requirements.txt
 ```
 
 ## Invoke
@@ -80,6 +88,7 @@ python3 scripts/grill_runner.py --mode diff --depth standard
 python3 scripts/grill_runner.py --mode repo --depth deep --max-files 40 --run-checks
 python3 scripts/grill_runner.py --scope SKILL.md,scripts/grill_runner.py --plan README.md --run-checks
 python3 scripts/grill_runner.py --mode repo --run-checks --progress --jobs 8
+python3 scripts/grill_runner.py --diff-sessions .grill-me-code/sessions/old.json .grill-me-code/latest.json
 ```
 
 Create or use a baseline:
@@ -115,7 +124,13 @@ static_patterns:
     severity: warning
     regex: dangerousCall\(
     title: Team-specific dangerous call
+check_plugins:
+  - name: go-test
+    command: ["go", "test", "./..."]
+    kind: test
 ```
+
+The score is a transparent heuristic, not a calibrated probability. `scripts/calibrate_scores.py` runs the small corpus in `calibration/cases.json` so threshold changes have visible expected outcomes.
 
 ## Skill Contents
 
@@ -125,8 +140,10 @@ static_patterns:
 - `scripts/grill_packet.py`: creates `CODE-GRILL-PACKET.md` artifacts from repo/diff/scope.
 - `scripts/grill_runner.py`: runs packet generation, static checks, project check discovery, scoring, state, and report output.
 - `scripts/grill_learn.py`: records finding outcomes for the learning loop.
+- `scripts/calibrate_scores.py`: checks scoring thresholds against known expected cases.
 - `scripts/validate_skill.py`: local structural validation.
 - `.grill-me-code.example.yaml`: configurable policy example.
+- `calibration/cases.json`: expected verdict cases for scoring drift checks.
 - `assets/github-actions/grill-me-code.yml`: optional CI workflow template for consumer repos.
 - `examples/`: sample packet and report artifacts.
 
@@ -137,6 +154,7 @@ Run local validation:
 ```bash
 python3 scripts/validate_skill.py
 python3 -m unittest discover -s tests
+python3 scripts/calibrate_scores.py
 python3 scripts/grill_packet.py --mode repo --max-files 8 --output /tmp/CODE-GRILL-PACKET.md
 python3 scripts/grill_runner.py --mode repo --max-files 8 --output-dir /tmp/grill-me-code
 ```

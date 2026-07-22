@@ -31,3 +31,8 @@ static_patterns:
     severity: warning
     regex: dangerousCall\(
     title: Team-specific dangerous call needs a safer wrapper or proof.
+
+check_plugins:
+  - name: go-test
+    command: ["go", "test", "./..."]
+    kind: test

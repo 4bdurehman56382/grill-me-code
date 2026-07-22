@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
 import datetime as dt
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from typing import Any
 
 from grill_packet import build_packet, git_diff_files, git_repo_files, repo_root, scoped_files
 
+
+SEVERITY_RANK = {"nit": 1, "question": 2, "warning": 3, "blocker": 4, "blocked": 5}
 
 SOURCE_EXTENSIONS = {
     ".c",
@@ -87,6 +90,10 @@ TEST_RELEVANT_EXTENSIONS = {
 TEST_PATTERNS = [
     re.compile(r"(^|/)(test|tests|spec|__tests__)(/|$)", re.I),
     re.compile(r"(\.test|\.spec)\.(js|jsx|ts|tsx|py|rb|go|rs)$", re.I),
+    re.compile(r"(^|/)test_[^/]+\.py$", re.I),
+    re.compile(r"(^|/)[^/]+_test\.go$", re.I),
+    re.compile(r"(^|/)[^/]+_(test|spec)\.rb$", re.I),
+    re.compile(r"\.feature$", re.I),
 ]
 
 VALID_SEVERITIES = {"blocked", "blocker", "warning", "question", "nit"}
@@ -115,6 +122,7 @@ BUILTIN_STATIC_PATTERNS = [
     StaticPattern("warning", "SEC-009", re.compile(r"Access-Control-Allow-Origin['\"]?\s*[:,]\s*['\"]\*|cors\s*\(\s*\{?\s*origin\s*:\s*['\"]\*", re.I), "Wildcard CORS needs an explicit trust boundary.", True),
     StaticPattern("warning", "SEC-010", re.compile(r"(?:redirect|res\.redirect|window\.location|location\.href)\s*\([^)]*(?:req\.|request|query|params|body)", re.I), "Potential open redirect needs allow-listing."),
     StaticPattern("warning", "SEC-011", re.compile(r"new\s+RegExp\s*\([^)]*(?:req\.|request|query|params|body)|re\.compile\s*\([^)]*\([^)]*[+*][^)]*\)[+*]", re.I), "Potential regex DoS needs bounded input or a safer expression."),
+    StaticPattern("blocker", "SEC-012", re.compile(r"\bos\.system\s*\(|child_process\.(?:exec|execSync)\s*\(|require\(['\"]child_process['\"]\)\.(?:exec|execSync)\s*\(", re.I), "Command execution with dynamic input needs containment proof."),
     StaticPattern("question", "OPS-002", re.compile(r"(?:https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)|localhost:\d+|[\"']:\d{4,5}[\"'])", re.I), "Hardcoded URL or port may need environment configuration.", True),
     StaticPattern("warning", "BUG-001", re.compile(r"catch\s*\([^)]*\)\s*\{\s*\}|except\s*:\s*(pass)?\s*$", re.I), "Empty or broad error handling can hide failures."),
     StaticPattern("warning", "BUG-002", re.compile(r"\bTODO\b|\bFIXME\b|\bHACK\b", re.I), "Unresolved implementation marker in reviewed scope."),
@@ -139,6 +147,7 @@ DEFAULT_CONFIG = {
     },
     "severity_overrides": {},
     "static_patterns": [],
+    "check_plugins": [],
 }
 
 
@@ -194,84 +203,6 @@ def read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def parse_scalar(value: str) -> Any:
-    value = value.strip()
-    if not value:
-        return ""
-    if value in {"true", "True"}:
-        return True
-    if value in {"false", "False"}:
-        return False
-    if value in {"null", "Null", "~"}:
-        return None
-    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-        return value[1:-1]
-    try:
-        return int(value)
-    except ValueError:
-        return value
-
-
-def simple_yaml_load(text: str) -> dict[str, Any]:
-    lines = []
-    for raw_line in text.splitlines():
-        line = raw_line.split("#", 1)[0].rstrip()
-        if line.strip():
-            lines.append((len(line) - len(line.lstrip(" ")), line.strip()))
-
-    def parse_block(index: int, indent: int) -> tuple[Any, int]:
-        if index >= len(lines):
-            return {}, index
-        is_list = lines[index][0] == indent and lines[index][1].startswith("- ")
-        if is_list:
-            result = []
-            while index < len(lines) and lines[index][0] == indent and lines[index][1].startswith("- "):
-                item_text = lines[index][1][2:].strip()
-                index += 1
-                if not item_text:
-                    item, index = parse_block(index, indent + 2)
-                    result.append(item)
-                    continue
-                if ":" in item_text:
-                    key, value = item_text.split(":", 1)
-                    item = {key.strip(): parse_scalar(value)}
-                    while index < len(lines) and lines[index][0] > indent:
-                        child_indent, child_text = lines[index]
-                        if child_indent < indent + 2 or child_text.startswith("- "):
-                            break
-                        if ":" not in child_text:
-                            index += 1
-                            continue
-                        child_key, child_value = child_text.split(":", 1)
-                        if child_value.strip():
-                            item[child_key.strip()] = parse_scalar(child_value)
-                            index += 1
-                        else:
-                            nested, index = parse_block(index + 1, child_indent + 2)
-                            item[child_key.strip()] = nested
-                    result.append(item)
-                else:
-                    result.append(parse_scalar(item_text))
-            return result, index
-
-        result: dict[str, Any] = {}
-        while index < len(lines) and lines[index][0] == indent:
-            _, item_text = lines[index]
-            if item_text.startswith("- ") or ":" not in item_text:
-                break
-            key, value = item_text.split(":", 1)
-            index += 1
-            if value.strip():
-                result[key.strip()] = parse_scalar(value)
-            else:
-                nested, index = parse_block(index, indent + 2)
-                result[key.strip()] = nested
-        return result, index
-
-    parsed, _ = parse_block(0, 0)
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def read_structured_config(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     if path.suffix == ".json":
@@ -279,8 +210,8 @@ def read_structured_config(path: Path) -> dict[str, Any]:
     else:
         try:
             import yaml  # type: ignore
-        except ImportError:
-            value = simple_yaml_load(text)
+        except ImportError as error:
+            raise ValueError("YAML config requires PyYAML. Install PyYAML or use .grill-me-code.json.") from error
         else:
             value = yaml.safe_load(text) or {}
     if not isinstance(value, dict):
@@ -341,6 +272,9 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
 
     patterns = config.get("static_patterns")
     config["static_patterns"] = patterns if isinstance(patterns, list) else []
+
+    check_plugins = config.get("check_plugins")
+    config["check_plugins"] = check_plugins if isinstance(check_plugins, list) else []
     return config
 
 
@@ -450,9 +384,56 @@ def resolve_files(root: Path, args: argparse.Namespace) -> tuple[str, list[Path]
     return mode, files
 
 
+def git_changed_lines(root: Path, base: str | None) -> dict[str, set[int]]:
+    command = ["git", "-C", str(root), "diff", "--unified=0"]
+    if base:
+        command.append(base)
+    try:
+        raw = subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return {}
+
+    changed: dict[str, set[int]] = {}
+    current_file = ""
+    for line in raw.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            current_file = ""
+            if target.startswith("b/"):
+                current_file = target[2:]
+                changed.setdefault(current_file, set())
+            continue
+        if not current_file or not line.startswith("@@"):
+            continue
+        match = re.search(r"\+(\d+)(?:,(\d+))?", line)
+        if not match:
+            continue
+        start = int(match.group(1))
+        count = int(match.group(2) or "1")
+        if count == 0:
+            continue
+        changed[current_file].update(range(start, start + count))
+    return {path: lines for path, lines in changed.items() if lines}
+
+
+def annotate_diff_status(findings: list[dict[str, Any]], changed_lines: dict[str, set[int]]) -> list[dict[str, Any]]:
+    for finding in findings:
+        file_path = finding.get("file")
+        line = finding.get("line")
+        if not changed_lines:
+            finding["diff_status"] = "scope"
+        elif not file_path or not line:
+            finding["diff_status"] = "scope"
+        elif file_path in changed_lines:
+            finding["diff_status"] = "introduced" if int(line) in changed_lines[file_path] else "legacy"
+        else:
+            finding["diff_status"] = "scope"
+    return findings
+
+
 def finding_code(finding: dict[str, Any]) -> str:
     identifier = str(finding.get("id", ""))
-    return re.sub(r"-\d{3}$", "", identifier)
+    return re.sub(r"(?:-AST)?-\d{3}$", "", identifier)
 
 
 def finding_fingerprint(finding: dict[str, Any]) -> str:
@@ -471,6 +452,45 @@ def annotate_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
         finding["code"] = finding_code(finding)
         finding["fingerprint"] = finding_fingerprint(finding)
     return findings
+
+
+def highest_severity(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    left_rank = SEVERITY_RANK.get(str(left.get("severity", "question")), 2)
+    right_rank = SEVERITY_RANK.get(str(right.get("severity", "question")), 2)
+    if right_rank == left_rank and right.get("source") == "python-ast":
+        return right
+    return right if right_rank > left_rank else left
+
+
+def combine_same_line_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for finding in findings:
+        if not finding.get("file") or not finding.get("line"):
+            key = (f"__id__:{finding.get('id')}", 0, "")
+        else:
+            key = (
+                str(finding.get("file", "")),
+                int(finding.get("line") or 0),
+                str(finding.get("evidence", "")).strip(),
+            )
+        if key not in grouped:
+            item = dict(finding)
+            item["matched_codes"] = [finding.get("code") or finding_code(finding)]
+            item["related_ids"] = [finding.get("id")]
+            grouped[key] = item
+            continue
+
+        current = grouped[key]
+        selected = highest_severity(current, finding)
+        winner = dict(selected)
+        codes = list(dict.fromkeys(list_value(current.get("matched_codes")) + [finding.get("code") or finding_code(finding)]))
+        related_ids = list(dict.fromkeys(list_value(current.get("related_ids")) + [finding.get("id")]))
+        winner["matched_codes"] = codes
+        winner["related_ids"] = related_ids
+        if selected is not current:
+            winner["combined_with"] = current.get("id")
+        grouped[key] = winner
+    return annotate_findings(sorted(grouped.values(), key=lambda item: (str(item.get("file", "")), int(item.get("line") or 0), str(item.get("id", "")))))
 
 
 def apply_severity_overrides(findings: list[dict[str, Any]], config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -567,6 +587,84 @@ def write_baseline(path: Path, findings: list[dict[str, Any]], existing: dict[st
     write_json(path, {"version": 1, "generated": utc_now(), "findings": sorted(by_fingerprint.values(), key=lambda item: item["fingerprint"])})
 
 
+def comment_stripped_surface(path: Path, line: str) -> str:
+    stripped = line.lstrip()
+    suffix = path.suffix.lower()
+    if suffix in {".py", ".sh", ".rb"} and stripped.startswith("#"):
+        return ""
+    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".java", ".go", ".rs", ".c", ".cc", ".cpp", ".cs", ".php"}:
+        if stripped.startswith(("//", "/*", "*")):
+            return ""
+    return line
+
+
+def todo_comment_surface(path: Path, line: str) -> str:
+    stripped = line.lstrip()
+    suffix = path.suffix.lower()
+    if suffix in {".py", ".sh", ".rb", ".yaml", ".yml"} and stripped.startswith("#"):
+        return stripped
+    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".java", ".go", ".rs", ".c", ".cc", ".cpp", ".cs", ".php", ".css"}:
+        if stripped.startswith(("//", "/*", "*")):
+            return stripped
+    return ""
+
+
+def ast_call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = ast_call_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    return ""
+
+
+def python_ast_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    findings = []
+    ordinal = 1
+    ast_rules = {
+        "eval": ("blocker", "SEC-001", "Dynamic code execution can become injection."),
+        "exec": ("blocker", "SEC-001", "Dynamic code execution can become injection."),
+        "os.system": ("blocker", "SEC-012", "Command execution with dynamic input needs containment proof."),
+        "pickle.load": ("blocker", "SEC-006", "Unsafe deserialization can execute or hydrate attacker-controlled data."),
+        "pickle.loads": ("blocker", "SEC-006", "Unsafe deserialization can execute or hydrate attacker-controlled data."),
+        "marshal.loads": ("blocker", "SEC-006", "Unsafe deserialization can execute or hydrate attacker-controlled data."),
+        "yaml.load": ("blocker", "SEC-006", "Unsafe deserialization can execute or hydrate attacker-controlled data."),
+    }
+    for path in files:
+        if path.suffix != ".py":
+            continue
+        rel = str(path.relative_to(root))
+        try:
+            source = path.read_text(encoding="utf-8", errors="ignore")
+            tree = ast.parse(source, filename=rel)
+            lines = source.splitlines()
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = ast_call_name(node.func)
+            if name.startswith("subprocess.") and any(keyword.arg == "shell" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in node.keywords):
+                severity, code, title = ("blocker", "SEC-003", "Shell execution with interpolation risk.")
+            elif name in ast_rules:
+                severity, code, title = ast_rules[name]
+            else:
+                continue
+            line_number = getattr(node, "lineno", 0) or 0
+            evidence = lines[line_number - 1].strip()[:240] if 0 < line_number <= len(lines) else ""
+            findings.append({
+                "id": f"{code}-AST-{ordinal:03d}",
+                "severity": severity,
+                "file": rel,
+                "line": line_number,
+                "title": title,
+                "evidence": evidence,
+                "source": "python-ast",
+            })
+            ordinal += 1
+    return annotate_findings(findings)
+
+
 def static_findings(root: Path, files: list[Path], patterns: list[StaticPattern] | None = None) -> list[dict[str, Any]]:
     patterns = patterns or list(BUILTIN_STATIC_PATTERNS)
     findings = []
@@ -580,10 +678,18 @@ def static_findings(root: Path, files: list[Path], patterns: list[StaticPattern]
         except OSError:
             continue
         for line_number, line in enumerate(lines, start=1):
-            code_surface = STRING_LITERAL_RE.sub('""', line)
+            surface = comment_stripped_surface(path, line)
+            code_surface = STRING_LITERAL_RE.sub('""', surface) if surface else ""
             context = "\n".join(lines[max(0, line_number - 4):line_number + 3]).lower()
             for rule in patterns:
-                scan_line = line if rule.include_strings and not is_test_file(path) else code_surface
+                if not surface and rule.code != "BUG-002":
+                    continue
+                if rule.code == "BUG-002":
+                    scan_line = todo_comment_surface(path, line)
+                    if not scan_line:
+                        continue
+                else:
+                    scan_line = surface if rule.include_strings and not is_test_file(path) else code_surface
                 if rule.code == "SEC-007" and "try" in context:
                     continue
                 if rule.pattern.search(scan_line):
@@ -597,7 +703,8 @@ def static_findings(root: Path, files: list[Path], patterns: list[StaticPattern]
                         "source": rule.source,
                     })
                     ordinal += 1
-    return annotate_findings(findings)
+    findings.extend(python_ast_findings(root, files))
+    return combine_same_line_findings(annotate_findings(findings))
 
 
 def syntax_commands(root: Path, files: list[Path]) -> list[dict[str, Any]]:
@@ -658,30 +765,123 @@ def package_scripts(root: Path) -> dict[str, str]:
     return scripts if isinstance(scripts, dict) else {}
 
 
-def discover_project_checks(root: Path) -> list[dict[str, Any]]:
+def command_available(root: Path, command: list[str]) -> bool:
+    if not command:
+        return False
+    executable = command[0]
+    executable_path = Path(executable)
+    if executable_path.is_absolute():
+        return executable_path.exists()
+    if "/" in executable or "\\" in executable:
+        return (root / executable).exists()
+    return bool(shutil.which(executable))
+
+
+def make_check(name: str, command: list[str], kind: str, source: str = "discovered", missing_reason: str = "") -> dict[str, Any]:
+    available = not missing_reason
+    return {
+        "name": name,
+        "command": command,
+        "kind": kind,
+        "source": source,
+        "available": available,
+        "missing_reason": missing_reason,
+    }
+
+
+def configured_check_plugins(config: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     checks = []
+    findings = []
+    for index, item in enumerate(config.get("check_plugins", []), start=1):
+        if not isinstance(item, dict):
+            findings.append(config_finding(f"CONFIG-CHECK-{index:03d}", "Check plugin must be an object"))
+            continue
+        name = str(item.get("name") or f"custom-check-{index}")
+        raw_command = item.get("command")
+        kind = str(item.get("kind") or "custom")
+        if isinstance(raw_command, list):
+            command = [str(part) for part in raw_command]
+        elif isinstance(raw_command, str):
+            command = shlex.split(raw_command)
+        else:
+            findings.append(config_finding(f"CONFIG-CHECK-{index:03d}", f"Check plugin {name} is missing command"))
+            continue
+        if not command:
+            findings.append(config_finding(f"CONFIG-CHECK-{index:03d}", f"Check plugin {name} command is empty"))
+            continue
+        checks.append(make_check(name, command, kind, "config"))
+    return checks, findings
+
+
+def check_health_findings(root: Path, checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    findings = []
+    for item in checks:
+        if item.get("available", True):
+            continue
+        findings.append({
+            "id": f"CHECK-MISSING-{len(findings) + 1:03d}",
+            "severity": "question",
+            "title": item.get("missing_reason") or f"Check is unavailable: {item.get('name')}",
+            "source": "check-discovery",
+            "evidence": " ".join(item.get("command", [])),
+        })
+    return annotate_findings(findings)
+
+
+def discover_project_checks(root: Path, config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    checks = []
+    config = config or DEFAULT_CONFIG
     scripts = package_scripts(root)
+    npm_available = bool(shutil.which("npm"))
     for name in ["lint", "typecheck", "check", "test"]:
         if name in scripts:
-            checks.append({"name": f"npm:{name}", "command": ["npm", "run", name], "kind": name})
+            missing = "" if npm_available else f"npm script {name} exists but npm is not installed"
+            checks.append(make_check(f"npm:{name}", ["npm", "run", name], name, "package.json", missing))
 
     local_bin = root / "node_modules" / ".bin"
     if "lint" not in scripts and any((root / name).exists() for name in ["eslint.config.js", "eslint.config.mjs", ".eslintrc", ".eslintrc.json"]):
         eslint = local_bin / ("eslint.cmd" if os.name == "nt" else "eslint")
         if eslint.exists():
-            checks.append({"name": "eslint", "command": [str(eslint), "."], "kind": "static-analysis"})
+            checks.append(make_check("eslint", [str(eslint), "."], "static-analysis"))
+        else:
+            checks.append(make_check("eslint", [str(eslint), "."], "static-analysis", "discovered", "ESLint config found but node_modules/.bin/eslint is missing"))
     if "typecheck" not in scripts and (root / "tsconfig.json").exists():
         tsc = local_bin / ("tsc.cmd" if os.name == "nt" else "tsc")
         if tsc.exists():
-            checks.append({"name": "tsc", "command": [str(tsc), "--noEmit"], "kind": "typecheck"})
+            checks.append(make_check("tsc", [str(tsc), "--noEmit"], "typecheck"))
+        else:
+            checks.append(make_check("tsc", [str(tsc), "--noEmit"], "typecheck", "discovered", "tsconfig.json found but node_modules/.bin/tsc is missing"))
 
     if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists() or (root / "tests").exists():
         if shutil.which("pytest"):
-            checks.append({"name": "pytest", "command": ["pytest", "-q"], "kind": "test"})
+            checks.append(make_check("pytest", ["pytest", "-q"], "test"))
         elif (root / "tests").exists():
-            checks.append({"name": "python-unittest", "command": [sys.executable, "-m", "unittest", "discover", "-s", "tests"], "kind": "test"})
+            checks.append(make_check("python-unittest", [sys.executable, "-m", "unittest", "discover", "-s", "tests"], "test"))
         else:
-            checks.append({"name": "python-unittest", "command": [sys.executable, "-m", "unittest", "discover"], "kind": "test"})
+            checks.append(make_check("python-unittest", [sys.executable, "-m", "unittest", "discover"], "test"))
+
+    if (root / "Makefile").exists():
+        try:
+            makefile = (root / "Makefile").read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            makefile = ""
+        if re.search(r"^test\s*:", makefile, re.M):
+            missing = "" if shutil.which("make") else "Makefile test target found but make is not installed"
+            checks.append(make_check("make:test", ["make", "test"], "test", "Makefile", missing))
+
+    if (root / "go.mod").exists():
+        missing = "" if shutil.which("go") else "go.mod found but go is not installed"
+        checks.append(make_check("go:test", ["go", "test", "./..."], "test", "go.mod", missing))
+
+    if (root / "Cargo.toml").exists():
+        missing = "" if shutil.which("cargo") else "Cargo.toml found but cargo is not installed"
+        checks.append(make_check("cargo:test", ["cargo", "test"], "test", "Cargo.toml", missing))
+
+    composer = read_json(root / "composer.json")
+    composer_scripts = composer.get("scripts") if isinstance(composer, dict) else {}
+    if isinstance(composer_scripts, dict) and "test" in composer_scripts:
+        missing = "" if shutil.which("composer") else "composer.json test script found but composer is not installed"
+        checks.append(make_check("composer:test", ["composer", "test"], "test", "composer.json", missing))
 
     for tool, command in [
         ("ruff", ["ruff", "check", "."]),
@@ -689,7 +889,14 @@ def discover_project_checks(root: Path) -> list[dict[str, Any]]:
         ("semgrep", ["semgrep", "--config=auto", "--error", "."]),
     ]:
         if shutil.which(tool):
-            checks.append({"name": tool, "command": command, "kind": "static-analysis"})
+            checks.append(make_check(tool, command, "static-analysis"))
+
+    plugin_checks, _ = configured_check_plugins(config)
+    for item in plugin_checks:
+        if not command_available(root, item["command"]):
+            item["available"] = False
+            item["missing_reason"] = f"Configured check {item['name']} command is not available: {item['command'][0]}"
+        checks.append(item)
 
     return checks
 
@@ -697,6 +904,9 @@ def discover_project_checks(root: Path) -> list[dict[str, Any]]:
 def run_project_checks(root: Path, checks: list[dict[str, Any]], timeout: int, progress: bool = False) -> list[dict[str, Any]]:
     results = []
     for item in checks:
+        if not item.get("available", True):
+            emit_progress(progress, f"SKIP {item['name']} ({item.get('missing_reason')})")
+            continue
         emit_progress(progress, f"running {item['name']}")
         result = run_command(item["command"], root, timeout)
         result["name"] = item["name"]
@@ -704,6 +914,18 @@ def run_project_checks(root: Path, checks: list[dict[str, Any]], timeout: int, p
         emit_progress(progress, f"{'PASS' if result.get('ok') else 'FAIL'} {item['name']}")
         results.append(result)
     return results
+
+
+def plan_mentions_file(plan_text: str, rel_path: str, basename: str) -> bool:
+    normalized = plan_text.replace("\\", "/")
+    rel = rel_path.lower().replace("\\", "/")
+    name = basename.lower()
+    if rel in normalized:
+        return True
+    if "." not in name:
+        return False
+    pattern = rf"(?<![\w./-]){re.escape(name)}(?![\w./-])"
+    return bool(re.search(pattern, normalized))
 
 
 def analyze_plan_cross_reference(root: Path, files: list[Path], plan_path: str | None) -> list[dict[str, Any]]:
@@ -721,8 +943,7 @@ def analyze_plan_cross_reference(root: Path, files: list[Path], plan_path: str |
     findings = []
     for path in files:
         rel = str(path.relative_to(root))
-        basename = path.name.lower()
-        if rel.lower() not in text and basename not in text:
+        if not plan_mentions_file(text, rel, path.name):
             findings.append({
                 "id": f"PLAN-GAP-{len(findings) + 1:03d}",
                 "severity": "question",
@@ -775,6 +996,7 @@ def score_session(
     test_files: int,
     code_files: int,
     config: dict[str, Any] | None = None,
+    diff_aware: bool = False,
 ) -> dict[str, Any]:
     config = config or DEFAULT_CONFIG
     thresholds = config.get("thresholds", {})
@@ -785,8 +1007,21 @@ def score_session(
         severity_counts[severity] = severity_counts.get(severity, 0) + 1
     failed_checks = [result for result in check_results if not result.get("ok")]
     passed_checks = [result for result in check_results if result.get("ok")]
-    risk = sum(severity_counts.get(sev, 0) * int(weight) for sev, weight in weights.items() if sev != "blocked")
-    risk += len(failed_checks) * int(thresholds.get("failed_check_risk", 20))
+    if diff_aware:
+        introduced_findings = [finding for finding in findings if finding.get("diff_status", "scope") in {"introduced", "scope"}]
+        legacy_findings = [finding for finding in findings if finding.get("diff_status") == "legacy"]
+    else:
+        introduced_findings = findings
+        legacy_findings = []
+
+    def weighted_risk(items: list[dict[str, Any]]) -> int:
+        return sum(int(weights.get(finding.get("severity", "question"), 5)) for finding in items if finding.get("severity") != "blocked")
+
+    check_risk = len(failed_checks) * int(thresholds.get("failed_check_risk", 20))
+    introduced_risk = weighted_risk(introduced_findings)
+    legacy_risk = weighted_risk(legacy_findings)
+    total_risk = min(100, introduced_risk + legacy_risk + check_risk)
+    risk = introduced_risk + check_risk if diff_aware else total_risk
     risk = min(100, risk)
 
     proof = 0
@@ -801,7 +1036,9 @@ def score_session(
     proof = min(100, proof)
 
     ship_score = max(0, min(100, round((proof * 0.65) + ((100 - risk) * 0.35))))
-    code_blockers = severity_counts.get("blocker", 0)
+    introduced_blockers = sum(1 for finding in introduced_findings if finding.get("severity") == "blocker")
+    legacy_blockers = sum(1 for finding in legacy_findings if finding.get("severity") == "blocker")
+    code_blockers = introduced_blockers if diff_aware else severity_counts.get("blocker", 0)
     blocked = severity_counts.get("blocked", 0)
     if not files:
         verdict = "BLOCKED"
@@ -809,6 +1046,8 @@ def score_session(
         verdict = "DO NOT SHIP"
     elif blocked > 0:
         verdict = "BLOCKED"
+    elif diff_aware and legacy_blockers:
+        verdict = "SHIP WITH RISKS"
     elif risk >= int(thresholds.get("ship_with_risks_risk", 35)) or proof < int(thresholds.get("min_proof_ship", 60)):
         verdict = "SHIP WITH RISKS"
     else:
@@ -816,13 +1055,119 @@ def score_session(
 
     return {
         "risk_score": risk,
+        "introduced_risk_score": min(100, introduced_risk + check_risk),
+        "legacy_risk_score": min(100, legacy_risk),
+        "total_risk_score": total_risk,
         "proof_score": proof,
         "ship_score": ship_score,
         "verdict": verdict,
         "severity_counts": severity_counts,
+        "introduced_findings": len(introduced_findings),
+        "legacy_findings": len(legacy_findings),
+        "introduced_blockers": introduced_blockers,
+        "legacy_blockers": legacy_blockers,
         "failed_checks": len(failed_checks),
         "passed_checks": len(passed_checks),
+        "diff_aware": diff_aware,
     }
+
+
+JURY_LENSES = {
+    "Breaker": {
+        "codes": ("BUG", "SEC-001", "SEC-003", "SEC-012"),
+        "sources": ("test-aware-verification",),
+        "questions": [
+            "Which input, state, timing, or dependency response breaks this?",
+            "What failure mode still lacks an executable proof?",
+        ],
+    },
+    "Security": {
+        "codes": ("SEC",),
+        "sources": ("python-ast",),
+        "questions": [
+            "Can user input reach shell, path, HTML, eval, redirect, CORS, or deserialization boundaries?",
+            "Which finding needs a sanitizer, allow-list, or containment proof?",
+        ],
+    },
+    "Tester": {
+        "codes": ("TEST",),
+        "sources": ("test-aware-verification",),
+        "check_kinds": ("test", "typecheck", "check"),
+        "questions": [
+            "Which assertion would have failed before the fix?",
+            "Which risky branch still has no test proof?",
+        ],
+    },
+    "Refactorer": {
+        "codes": ("PLAN", "BUG"),
+        "sources": ("plan-cross-reference",),
+        "questions": [
+            "What public contract might this change accidentally alter?",
+            "Which renamed or moved behavior needs parity proof?",
+        ],
+    },
+    "Release Captain": {
+        "codes": ("OPS", "PLAN", "CHECK"),
+        "sources": ("check-discovery", "configuration"),
+        "questions": [
+            "What rollback, config, migration, or deploy order is still unproven?",
+            "Which missing check blocks release confidence?",
+        ],
+    },
+    "Maintainer": {
+        "codes": ("BUG", "OPS", "TEAM"),
+        "sources": ("custom-static",),
+        "questions": [
+            "What will the next engineer misunderstand?",
+            "Which warning represents future maintenance drag rather than immediate breakage?",
+        ],
+    },
+}
+
+
+def lens_matches(lens: dict[str, Any], finding: dict[str, Any]) -> bool:
+    code = str(finding.get("code") or finding_code(finding))
+    source = str(finding.get("source", ""))
+    return any(code.startswith(prefix) for prefix in lens.get("codes", ())) or source in lens.get("sources", ())
+
+
+def lens_verdict(score: int, counts: dict[str, int], failed_checks: int) -> str:
+    if counts.get("blocked", 0):
+        return "BLOCKED"
+    if counts.get("blocker", 0) or failed_checks:
+        return "DO NOT SHIP"
+    if score >= 35 or counts.get("warning", 0):
+        return "SHIP WITH RISKS"
+    return "SHIP"
+
+
+def jury_scores(findings: list[dict[str, Any]], check_results: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+    weights = config.get("thresholds", {}).get("severity_weights", DEFAULT_CONFIG["thresholds"]["severity_weights"])
+    failed_by_kind: dict[str, int] = {}
+    for result in check_results:
+        if result.get("ok"):
+            continue
+        kind = str(result.get("kind", "check"))
+        failed_by_kind[kind] = failed_by_kind.get(kind, 0) + 1
+
+    output = {}
+    for name, lens in JURY_LENSES.items():
+        relevant = [finding for finding in findings if lens_matches(lens, finding)]
+        counts = {"blocked": 0, "blocker": 0, "warning": 0, "question": 0, "nit": 0}
+        for finding in relevant:
+            severity = str(finding.get("severity", "question"))
+            counts[severity] = counts.get(severity, 0) + 1
+        failed_checks = sum(failed_by_kind.get(kind, 0) for kind in lens.get("check_kinds", ()))
+        risk = min(100, sum(counts.get(sev, 0) * int(weights.get(sev, 5)) for sev in counts if sev != "blocked") + failed_checks * int(config.get("thresholds", {}).get("failed_check_risk", 20)))
+        output[name] = {
+            "risk_score": risk,
+            "verdict": lens_verdict(risk, counts, failed_checks),
+            "findings": len(relevant),
+            "failed_checks": failed_checks,
+            "severity_counts": counts,
+            "questions": lens.get("questions", []),
+        }
+    return output
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
@@ -862,6 +1207,9 @@ def markdown_report(session: dict[str, Any]) -> str:
         "",
         f"Decision: **{score['verdict']}**",
         f"Risk score: **{score['risk_score']}/100**",
+        f"Introduced risk: **{score.get('introduced_risk_score', score['risk_score'])}/100**",
+        f"Legacy risk: **{score.get('legacy_risk_score', 0)}/100**",
+        f"Total risk: **{score.get('total_risk_score', score['risk_score'])}/100**",
         f"Proof score: **{score['proof_score']}/100**",
         f"Ship score: **{score['ship_score']}/100**",
         "",
@@ -869,6 +1217,13 @@ def markdown_report(session: dict[str, Any]) -> str:
         "",
         f"Files reviewed: {len(session['files'])}",
         *[f"- `{path}`" for path in session["files"]],
+        "",
+        "## Diff Awareness",
+        "",
+        f"Diff-aware scoring: `{score.get('diff_aware', False)}`",
+        f"Changed-line files: {len(session.get('changed_lines', {}))}",
+        f"Introduced findings: {score.get('introduced_findings', 0)}",
+        f"Legacy findings: {score.get('legacy_findings', 0)}",
         "",
         "## Configuration",
         "",
@@ -886,6 +1241,7 @@ def markdown_report(session: dict[str, Any]) -> str:
                 f"### {finding['severity'].title()}: {finding['id']} - {finding['title']}",
                 "",
                 f"Source: `{finding.get('source', 'unknown')}`",
+                f"Diff status: `{finding.get('diff_status', 'scope')}`",
                 f"Location: {location}" if location != "``" else "Location: n/a",
                 f"Evidence: `{finding.get('evidence', '')}`" if finding.get("evidence") else "Evidence: n/a",
                 "",
@@ -922,6 +1278,21 @@ def markdown_report(session: dict[str, Any]) -> str:
             lines.append("No project checks discovered.")
     lines.append("")
 
+    jury = session.get("jury_scores", {})
+    if jury:
+        lines.extend(["## Jury Scores", ""])
+        for name, item in jury.items():
+            lines.extend([
+                f"### {name}",
+                "",
+                f"Verdict: **{item.get('verdict')}**",
+                f"Risk score: **{item.get('risk_score')}/100**",
+                f"Findings: {item.get('findings', 0)}",
+                f"Failed checks: {item.get('failed_checks', 0)}",
+                "",
+            ])
+        lines.append("")
+
     gsd = session["gsd"]
     lines.extend(["## GSD Bridge", ""])
     if gsd.get("detected"):
@@ -954,8 +1325,65 @@ def markdown_report(session: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def session_finding_map(session: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    output = {}
+    for finding in session.get("findings", []):
+        if not isinstance(finding, dict):
+            continue
+        fingerprint = finding.get("fingerprint") or finding_fingerprint(finding)
+        output[fingerprint] = finding
+    return output
+
+
+def diff_sessions(old_session: dict[str, Any], new_session: dict[str, Any]) -> dict[str, Any]:
+    old_findings = session_finding_map(old_session)
+    new_findings = session_finding_map(new_session)
+    old_keys = set(old_findings)
+    new_keys = set(new_findings)
+    return {
+        "old_session_id": old_session.get("session_id", ""),
+        "new_session_id": new_session.get("session_id", ""),
+        "old_verdict": old_session.get("score", {}).get("verdict", ""),
+        "new_verdict": new_session.get("score", {}).get("verdict", ""),
+        "old_score": old_session.get("score", {}),
+        "new_score": new_session.get("score", {}),
+        "added": [new_findings[key] for key in sorted(new_keys - old_keys)],
+        "resolved": [old_findings[key] for key in sorted(old_keys - new_keys)],
+        "persisting": [new_findings[key] for key in sorted(old_keys & new_keys)],
+    }
+
+
+def markdown_session_diff(diff: dict[str, Any]) -> str:
+    lines = [
+        "# CODE-GRILL-SESSION-DIFF",
+        "",
+        "## Verdict Change",
+        "",
+        f"Old: **{diff.get('old_verdict') or 'unknown'}**",
+        f"New: **{diff.get('new_verdict') or 'unknown'}**",
+        "",
+        "## Finding Delta",
+        "",
+        f"Added: {len(diff['added'])}",
+        f"Resolved: {len(diff['resolved'])}",
+        f"Persisting: {len(diff['persisting'])}",
+        "",
+    ]
+    for title, key in [("Added Findings", "added"), ("Resolved Findings", "resolved"), ("Persisting Findings", "persisting")]:
+        lines.extend([f"## {title}", ""])
+        if not diff[key]:
+            lines.extend(["None.", ""])
+            continue
+        for finding in diff[key]:
+            location = f"{finding.get('file', '')}:{finding.get('line', '')}".strip(":") or "n/a"
+            lines.append(f"- `{finding.get('id')}` {finding.get('severity')} {finding.get('title')} at `{location}`")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a CODE-GRILL engine pass with packet, checks, scoring, state, and verdict.")
+    parser.add_argument("--diff-sessions", nargs=2, metavar=("OLD", "NEW"), help="Compare two saved session JSON files and exit.")
     parser.add_argument("--mode", choices=["plan", "diff", "repo", "release", "fix", "scope"], default="diff")
     parser.add_argument("--depth", choices=["quick", "standard", "deep"], default="standard")
     parser.add_argument("--base", help="Optional git diff base, such as origin/main")
@@ -980,6 +1408,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.diff_sessions:
+        old_path = Path(args.diff_sessions[0])
+        new_path = Path(args.diff_sessions[1])
+        old_session = read_json(old_path)
+        new_session = read_json(new_path)
+        if not old_session or not new_session:
+            print("--diff-sessions requires two readable session JSON files.", file=sys.stderr)
+            return 2
+        diff = diff_sessions(old_session, new_session)
+        report = markdown_session_diff(diff)
+        root = repo_root(Path.cwd())
+        out_dir = (root / args.output_dir).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "CODE-GRILL-SESSION-DIFF.md").write_text(report, encoding="utf-8")
+        print(report)
+        return 0
+
     if args.mode == "scope" and not args.scope:
         print("--mode scope requires at least one --scope value.", file=sys.stderr)
         return 2
@@ -996,7 +1441,10 @@ def main(argv: list[str]) -> int:
     root = repo_root(Path.cwd())
     config, config_findings, config_path = load_config(root, args.config)
     static_patterns, pattern_config_findings = compile_static_patterns(config)
+    _, check_config_findings = configured_check_plugins(config)
     mode, files = resolve_files(root, args)
+    changed_lines = git_changed_lines(root, args.base) if mode == "diff" else {}
+    diff_aware = bool(changed_lines)
     emit_progress(args.progress, f"resolved {len(files)} file(s) in {mode} mode")
     generated = utc_now()
     session_id = args.session_id or generated.replace(":", "").replace("-", "").split("+")[0]
@@ -1014,6 +1462,7 @@ def main(argv: list[str]) -> int:
     raw_findings = []
     raw_findings.extend(config_findings)
     raw_findings.extend(pattern_config_findings)
+    raw_findings.extend(check_config_findings)
     raw_findings.extend(static_findings(root, files, static_patterns))
     raw_findings.extend(analyze_plan_cross_reference(root, files, args.plan))
     test_files = sum(1 for path in files if is_test_file(path))
@@ -1026,7 +1475,9 @@ def main(argv: list[str]) -> int:
             "title": "No test files are included in the reviewed scope",
             "source": "test-aware-verification",
         })
-    raw_findings = apply_severity_overrides(annotate_findings(raw_findings), config)
+    discovered_checks = discover_project_checks(root, config)
+    raw_findings.extend(check_health_findings(root, discovered_checks))
+    raw_findings = annotate_diff_status(combine_same_line_findings(apply_severity_overrides(annotate_findings(raw_findings), config)), changed_lines)
 
     baseline_findings = []
     baseline_was_read = False
@@ -1049,12 +1500,12 @@ def main(argv: list[str]) -> int:
         emit_progress(args.progress, f"updated baseline at {display_path(baseline_path, root)}")
 
     syntax_results = run_syntax_checks(root, files, min(args.timeout, 30), args.jobs, args.progress)
-    discovered_checks = discover_project_checks(root)
     project_results = run_project_checks(root, discovered_checks, args.timeout, args.progress) if args.run_checks else []
     check_results = syntax_results + project_results
 
     gsd = detect_gsd(root, args.gsd_phase)
-    score = score_session(files, findings, check_results, test_files, code_files, config)
+    score = score_session(files, findings, check_results, test_files, code_files, config, diff_aware)
+    jury = jury_scores(findings, check_results, config)
     session = {
         "session_id": session_id,
         "generated": generated,
@@ -1066,6 +1517,7 @@ def main(argv: list[str]) -> int:
         "code_files": code_files,
         "test_files": test_files,
         "test_relevant_files": test_relevant_files,
+        "changed_lines": {path: sorted(lines) for path, lines in changed_lines.items()},
         "packet": display_path(packet_path, root),
         "report": display_path(report_path, root),
         "raw_findings": raw_findings,
@@ -1085,6 +1537,7 @@ def main(argv: list[str]) -> int:
         "learning_store": display_path(learning_path, root),
         "gsd": gsd,
         "score": score,
+        "jury_scores": jury,
     }
 
     report_path.write_text(markdown_report(session), encoding="utf-8")
