@@ -20,6 +20,13 @@ scan:
   max_file_bytes: 2000000
   cache: true
 
+minimalism:
+  # off: no Ponytail-inspired complexity findings
+  # lite: scoped dependency bloat only
+  # full/ultra: dependencies plus wrapper and abstraction heuristics
+  mode: lite
+  max_wrapper_lines: 4
+
 severity_overrides:
   # BUG-002: nit
   # OPS-002: question

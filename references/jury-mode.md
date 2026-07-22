@@ -66,6 +66,16 @@ Ask:
 - Is complexity now lower, or merely moved?
 - What will the next engineer misunderstand?
 
+### Minimalist
+
+Goal: make the correct solution shorter.
+
+Ask:
+
+- Can this be deleted, reused, or handled by the standard library?
+- Is this dependency, wrapper, factory, interface, or config buying flexibility that is not used?
+- What proof must stay even if the diff gets smaller?
+
 ## Verdict
 
 End Jury Mode with:

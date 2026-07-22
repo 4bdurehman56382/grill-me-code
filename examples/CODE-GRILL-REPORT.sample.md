@@ -55,6 +55,7 @@ Misses: 2
 ## Configuration
 
 Config: `.grill-me-code.yaml`
+Minimalism mode: `full`
 Baseline: `.grill-me-code/baseline.json`
 Suppressed findings: 1
 
@@ -79,6 +80,13 @@ Source: `test-aware-verification`
 Diff status: `scope`
 Location: n/a
 Evidence: n/a
+
+### Question: MIN-001-001 - Dependency may be replaceable by native or stdlib code.
+
+Source: `minimalism`
+Diff status: `scope`
+Location: `package.json:18`
+Evidence: `moment in dependencies; native: Intl.DateTimeFormat or Date for simple formatting/parsing.`
 
 ## Suppressed Findings
 
@@ -139,6 +147,13 @@ Verdict: **DO NOT SHIP**
 Risk score: **32/100**
 Findings: 1
 Failed checks: 1
+
+### Minimalist
+
+Verdict: **SHIP**
+Risk score: **5/100**
+Findings: 1
+Failed checks: 0
 
 ## Machine Marker
 

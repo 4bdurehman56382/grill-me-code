@@ -228,6 +228,52 @@ class GrillRunnerTests(unittest.TestCase):
             findings = grill_runner.static_findings(root, [sink, app])
             self.assertTrue(any(finding["source"] == "cross-file-flow" for finding in findings))
 
+    def test_minimalism_lite_detects_scoped_dependency_bloat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "package.json"
+            package.write_text('{"dependencies":{"moment":"^2.0.0"}}\n', encoding="utf-8")
+            config = grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {}))
+            findings = grill_runner.minimalism_findings(root, [package], config)
+            self.assertEqual(findings[0]["code"], "MIN-001")
+            self.assertEqual(findings[0]["source"], "minimalism")
+            self.assertIn("Intl.DateTimeFormat", findings[0]["evidence"])
+
+    def test_minimalism_ignores_unscoped_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.py"
+            source.write_text("print('ok')\n", encoding="utf-8")
+            (root / "package.json").write_text('{"dependencies":{"lodash":"^4.0.0"}}\n', encoding="utf-8")
+            config = grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {}))
+            self.assertEqual(grill_runner.minimalism_findings(root, [source], config), [])
+
+    def test_minimalism_full_detects_wrapper_and_speculative_interface(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.py"
+            source.write_text(
+                "from abc import ABC\n"
+                "class PaymentGateway(ABC):\n"
+                "    pass\n"
+                "def send_payment(order):\n"
+                "    return charge(order)\n",
+                encoding="utf-8",
+            )
+            config = grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {"minimalism": {"mode": "full"}}))
+            findings = grill_runner.minimalism_findings(root, [source], config)
+            codes = {finding["code"] for finding in findings}
+            self.assertIn("MIN-002", codes)
+            self.assertIn("MIN-003", codes)
+
+    def test_minimalism_off_suppresses_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "package.json"
+            package.write_text('{"dependencies":{"moment":"^2.0.0"}}\n', encoding="utf-8")
+            config = grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {"minimalism": {"mode": "off"}}))
+            self.assertEqual(grill_runner.minimalism_findings(root, [package], config), [])
+
     def test_cached_static_findings_reuses_unchanged_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -527,6 +573,22 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertIn("detected_languages: Python", config_text)
             self.assertIn("force-init", stderr.getvalue())
 
+    def test_runner_minimalism_cli_persists_mode_and_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text('{"dependencies":{"moment":"^2.0.0"}}\n', encoding="utf-8")
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = grill_runner.main(["--scope", "package.json", "--minimalism", "lite", "--output-dir", ".out"])
+            finally:
+                os.chdir(old_cwd)
+            session = json.loads((root / ".out" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual(session["minimalism"]["mode"], "lite")
+            self.assertTrue(any(finding["code"] == "MIN-001" for finding in session["findings"]))
+
     def test_runner_fail_on_do_not_ship_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -612,6 +674,12 @@ class GrillRunnerTests(unittest.TestCase):
         jury = grill_runner.jury_scores(findings, [], grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {})))
         self.assertEqual(jury["Security"]["verdict"], "DO NOT SHIP")
         self.assertEqual(jury["Security"]["findings"], 1)
+
+    def test_jury_scores_minimalist_lens(self):
+        findings = [{"id": "MIN-001-001", "code": "MIN-001", "severity": "question", "source": "minimalism"}]
+        jury = grill_runner.jury_scores(findings, [], grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {})))
+        self.assertEqual(jury["Minimalist"]["findings"], 1)
+        self.assertEqual(jury["Minimalist"]["risk_score"], 5)
 
     def test_session_diff_added_and_resolved(self):
         old = {"session_id": "old", "score": {"verdict": "DO NOT SHIP"}, "findings": [{"id": "A-001", "fingerprint": "old", "title": "old"}]}

@@ -27,6 +27,7 @@ The gap: developers also need a local, forkable, agent-native workflow that:
 - runs available local checks instead of only describing them
 - exposes structured analysis and reasoning plugin hooks instead of pretending every review is LLM-backed
 - discovers optional local security backends when available instead of bundling a heavy hosted scanner
+- adds Ponytail-inspired minimalism pressure so reviews ask what can be deleted, reused, or handled natively
 - can skip oversized files with explicit evidence and cache unchanged static findings
 - lets teams tune policy with config, baselines, suppressions, and severity overrides
 - separates introduced risk from legacy risk during diff reviews
@@ -54,7 +55,7 @@ A generated markdown artifact containing scope, risk lenses, hard questions, pro
 
 ### CODE-GRILL Runner
 
-A minimal-dependency CLI that resolves scope, runs configurable static heuristics plus targeted Python AST checks, basic Python/JS taint-style reaching-definition checks, JS/TS alias heuristics, command-use checks for Go/Rust/Kotlin/Swift/Dart/Java/C#/PHP, and lightweight JS/TS cross-file flow signals, discovers project checks, security backends, and check plugins, optionally runs those checks, separates setup-blocked findings from code risk, separates introduced risk from legacy risk, assigns risk/proof/ship scores plus bands/reasons, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
+A minimal-dependency CLI that resolves scope, runs configurable static heuristics plus targeted Python AST checks, basic Python/JS taint-style reaching-definition checks, JS/TS alias heuristics, command-use checks for Go/Rust/Kotlin/Swift/Dart/Java/C#/PHP, Ponytail-inspired minimalism heuristics, and lightweight JS/TS cross-file flow signals, discovers project checks, security backends, and check plugins, optionally runs those checks, separates setup-blocked findings from code risk, separates introduced risk from legacy risk, assigns risk/proof/ship scores plus bands/reasons, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
 
 It should remain honest: built-in scanning is useful pressure, not full call-graph taint analysis or a replacement for CodeQL/Semgrep/language-native SAST. Deep analysis belongs in analysis plugins, reasoning plugins, or project checks.
 
@@ -73,6 +74,10 @@ The runner should only claim plugin-backed reasoning when a configured command a
 ### Test Proof Quality
 
 The runner does not treat every test file as proof. It checks scoped tests for detectable assertions across common Python, JS, Java, Kotlin, Swift, Dart, Go, and Rust patterns, and calls out empty or obviously trivial assertions so `assert True` does not pass as confidence.
+
+### Minimalist Lens
+
+The runner can run Ponytail-inspired `lite`, `full`, or `ultra` minimalism passes. `lite` flags scoped dependency bloat with native or standard-library replacements. `full` and `ultra` also flag tiny delegating wrappers and speculative factories, builders, interfaces, or protocols. The point is not to delete safety. It is to make the correct solution shorter after the real flow is understood.
 
 ### Scale Guardrails
 
@@ -98,6 +103,7 @@ The same scope is reviewed through distinct lenses:
 - Refactorer: what contract might break?
 - Release Captain: what blocks ship?
 - Maintainer: what will be confusing later?
+- Minimalist: what can be deleted or replaced with something native?
 
 The runner gives each lens its own score and verdict. LLM-based grilling should use those scores as evidence, then add human-grade reasoning where the script cannot infer intent.
 

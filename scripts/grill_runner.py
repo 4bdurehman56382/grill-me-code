@@ -56,6 +56,8 @@ SOURCE_EXTENSIONS = {
     ".yml",
 }
 
+SOURCE_FILE_NAMES = {"Dockerfile", "Makefile", "package.json", "requirements.txt", "requirements-dev.txt"}
+
 CODE_EXTENSIONS = {
     ".c",
     ".cc",
@@ -164,6 +166,10 @@ DEFAULT_CONFIG = {
     "scan": {
         "max_file_bytes": 2000000,
         "cache": True,
+    },
+    "minimalism": {
+        "mode": "lite",
+        "max_wrapper_lines": 4,
     },
     "ignore": {
         "findings": [],
@@ -304,6 +310,13 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
         config["scan"] = scan
     scan.setdefault("max_file_bytes", DEFAULT_CONFIG["scan"]["max_file_bytes"])
     scan.setdefault("cache", DEFAULT_CONFIG["scan"]["cache"])
+
+    minimalism = config.setdefault("minimalism", {})
+    if not isinstance(minimalism, dict):
+        minimalism = {"mode": str(minimalism)}
+        config["minimalism"] = minimalism
+    minimalism.setdefault("mode", DEFAULT_CONFIG["minimalism"]["mode"])
+    minimalism.setdefault("max_wrapper_lines", DEFAULT_CONFIG["minimalism"]["max_wrapper_lines"])
 
     patterns = config.get("static_patterns")
     config["static_patterns"] = patterns if isinstance(patterns, list) else []
@@ -543,7 +556,7 @@ def resolve_files(root: Path, args: argparse.Namespace) -> tuple[str, list[Path]
         files = git_repo_files(root, args.max_files)
     else:
         files = git_diff_files(root, args.base, args.diff_filter)
-    files = [path for path in files if path.suffix in SOURCE_EXTENSIONS or path.name in {"Dockerfile", "Makefile"}]
+    files = [path for path in files if path.suffix in SOURCE_EXTENSIONS or path.name in SOURCE_FILE_NAMES]
     return mode, files
 
 
@@ -1412,6 +1425,247 @@ def raw_static_findings(root: Path, files: list[Path], patterns: list[StaticPatt
     findings.extend(javascript_semantic_findings(root, files))
     findings.extend(js_taint_findings(root, files))
     findings.extend(compiled_language_semantic_findings(root, files))
+    return annotate_findings(findings)
+
+
+MINIMALISM_MODES = {"off", "lite", "full", "ultra"}
+MINIMALISM_DEPENDENCY_REPLACEMENTS = {
+    "moment": ("native", "Intl.DateTimeFormat or Date for simple formatting/parsing."),
+    "dayjs": ("native", "Intl.DateTimeFormat or Date for simple formatting/parsing."),
+    "lodash": ("stdlib", "Array/Object/String built-ins for simple transforms."),
+    "underscore": ("stdlib", "Array/Object/String built-ins for simple transforms."),
+    "left-pad": ("stdlib", "String.prototype.padStart."),
+    "classnames": ("native", "template literals or array/filter/join for small class lists."),
+    "uuid": ("native", "crypto.randomUUID when the runtime supports it."),
+    "simplejson": ("stdlib", "json."),
+}
+
+
+def minimalism_mode(config: dict[str, Any], cli_mode: str | None = None) -> str:
+    raw = cli_mode or config.get("minimalism", {}).get("mode", DEFAULT_CONFIG["minimalism"]["mode"])
+    mode = str(raw).lower()
+    if mode in {"false", "none", "disabled"}:
+        return "off"
+    return mode if mode in MINIMALISM_MODES else DEFAULT_CONFIG["minimalism"]["mode"]
+
+
+def minimalism_wrapper_max_lines(config: dict[str, Any]) -> int:
+    try:
+        return max(1, int(config.get("minimalism", {}).get("max_wrapper_lines", DEFAULT_CONFIG["minimalism"]["max_wrapper_lines"])))
+    except (TypeError, ValueError):
+        return int(DEFAULT_CONFIG["minimalism"]["max_wrapper_lines"])
+
+
+def dependency_line_number(path: Path, dependency: str) -> int:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return 0
+    pattern = re.compile(rf"['\"]{re.escape(dependency)}['\"]\s*:")
+    for line_number, line in enumerate(lines, start=1):
+        if pattern.search(line):
+            return line_number
+    return 0
+
+
+def dependency_minimalism_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    findings = []
+    scoped = {str(path.relative_to(root)) for path in files}
+    package = read_json(root / "package.json")
+    if package and "package.json" in scoped:
+        for section in ["dependencies", "devDependencies", "optionalDependencies"]:
+            deps = package.get(section)
+            if not isinstance(deps, dict):
+                continue
+            for dependency in sorted(deps):
+                replacement = MINIMALISM_DEPENDENCY_REPLACEMENTS.get(dependency.lower())
+                if not replacement:
+                    continue
+                tag, alternative = replacement
+                findings.append({
+                    "id": f"MIN-001-{len(findings) + 1:03d}",
+                    "severity": "question",
+                    "file": "package.json",
+                    "line": dependency_line_number(root / "package.json", dependency),
+                    "title": "Dependency may be replaceable by native or stdlib code.",
+                    "source": "minimalism",
+                    "evidence": f"{dependency} in {section}; {tag}: {alternative}",
+                    "minimalism_tag": tag,
+                })
+
+    for filename in ["requirements.txt", "requirements-dev.txt"]:
+        path = root / filename
+        if filename not in scoped or not path.exists():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line_number, line in enumerate(lines, start=1):
+            dependency = re.split(r"[<>=~!;\s]", line.strip(), maxsplit=1)[0].lower()
+            replacement = MINIMALISM_DEPENDENCY_REPLACEMENTS.get(dependency)
+            if not replacement:
+                continue
+            tag, alternative = replacement
+            findings.append({
+                "id": f"MIN-001-{len(findings) + 1:03d}",
+                "severity": "question",
+                "file": filename,
+                "line": line_number,
+                "title": "Dependency may be replaceable by native or stdlib code.",
+                "source": "minimalism",
+                "evidence": f"{dependency}; {tag}: {alternative}",
+                "minimalism_tag": tag,
+            })
+    return findings
+
+
+def python_wrapper_minimalism_findings(root: Path, files: list[Path], max_lines: int) -> list[dict[str, Any]]:
+    findings = []
+    for path in files:
+        if path.suffix != ".py" or is_test_file(path):
+            continue
+        rel = str(path.relative_to(root))
+        try:
+            source = path.read_text(encoding="utf-8", errors="ignore")
+            tree = ast.parse(source, filename=rel)
+            lines = source.splitlines()
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name.startswith("__") or len(getattr(node, "body", [])) != 1:
+                continue
+            statement = node.body[0]
+            call: ast.Call | None = None
+            if isinstance(statement, ast.Return) and isinstance(statement.value, ast.Call):
+                call = statement.value
+            elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+                call = statement.value
+            if not call:
+                continue
+            end_line = getattr(node, "end_lineno", getattr(node, "lineno", 0)) or 0
+            line_count = max(1, end_line - int(getattr(node, "lineno", end_line)) + 1)
+            if line_count > max_lines:
+                continue
+            target = ast_call_name(call.func) or "another callable"
+            findings.append({
+                "id": f"MIN-002-{len(findings) + 1:03d}",
+                "severity": "nit",
+                "file": rel,
+                "line": getattr(node, "lineno", 0) or 0,
+                "title": "Tiny wrapper only delegates; inline it or prove the contract boundary.",
+                "source": "minimalism",
+                "evidence": f"{node.name} delegates to {target}",
+                "minimalism_tag": "shrink",
+            })
+    return findings
+
+
+def js_wrapper_minimalism_findings(root: Path, files: list[Path], max_lines: int) -> list[dict[str, Any]]:
+    findings = []
+    function_re = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{\s*return\s+([A-Za-z_$][\w$.]*)\s*\(")
+    arrow_re = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>\s*([A-Za-z_$][\w$.]*)\s*\(")
+    for path in files:
+        if path.suffix not in JS_TAINT_EXTENSIONS or is_test_file(path):
+            continue
+        rel = str(path.relative_to(root))
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line_number, line in enumerate(lines, start=1):
+            surface = comment_stripped_surface(path, line)
+            if not surface:
+                continue
+            match = function_re.search(surface) or arrow_re.search(surface)
+            if not match:
+                continue
+            if surface.count("\n") + 1 > max_lines:
+                continue
+            findings.append({
+                "id": f"MIN-002-{len(findings) + 1:03d}",
+                "severity": "nit",
+                "file": rel,
+                "line": line_number,
+                "title": "Tiny wrapper only delegates; inline it or prove the contract boundary.",
+                "source": "minimalism",
+                "evidence": f"{match.group(1)} delegates to {match.group(2)}",
+                "minimalism_tag": "shrink",
+            })
+    return findings
+
+
+def abstraction_minimalism_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    declarations: list[dict[str, Any]] = []
+    texts: dict[str, str] = {}
+    declaration_patterns = [
+        ({".ts", ".tsx", ".js", ".jsx", ".java", ".cs"}, re.compile(r"\binterface\s+([A-Za-z_][\w]*)\b")),
+        ({".go"}, re.compile(r"\btype\s+([A-Za-z_][\w]*)\s+interface\s*\{")),
+        ({".py"}, re.compile(r"\bclass\s+([A-Za-z_][\w]*)\((?:[^)]*\b(?:ABC|Protocol)\b[^)]*)\):")),
+    ]
+    factory_pattern = re.compile(r"\b(?:class|function|def)\s+([A-Za-z_][\w]*(?:Factory|Builder))\b")
+    for path in files:
+        if path.suffix not in CODE_EXTENSIONS or is_test_file(path):
+            continue
+        rel = str(path.relative_to(root))
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        texts[rel] = "\n".join(comment_stripped_surface(path, line) for line in lines)
+        for line_number, line in enumerate(lines, start=1):
+            surface = comment_stripped_surface(path, line)
+            if not surface:
+                continue
+            for suffixes, pattern in declaration_patterns:
+                if path.suffix not in suffixes:
+                    continue
+                match = pattern.search(surface)
+                if match:
+                    declarations.append({"name": match.group(1), "file": rel, "line": line_number, "kind": "interface"})
+                    break
+            factory = factory_pattern.search(surface)
+            if factory:
+                declarations.append({"name": factory.group(1), "file": rel, "line": line_number, "kind": "factory"})
+
+    findings = []
+    all_text = "\n".join(texts.values())
+    for item in declarations:
+        name = item["name"]
+        if item["kind"] == "factory":
+            title = "Factory/builder abstraction needs a second product or a shorter construction path."
+            tag = "yagni"
+        else:
+            implementation_hits = len(re.findall(rf"\bimplements\s+{re.escape(name)}\b|\bclass\s+\w+\s*\(\s*{re.escape(name)}\s*\)", all_text))
+            if implementation_hits > 1:
+                continue
+            title = "Interface or protocol has one-or-zero implementations in reviewed scope."
+            tag = "yagni"
+        findings.append({
+            "id": f"MIN-003-{len(findings) + 1:03d}",
+            "severity": "question",
+            "file": item["file"],
+            "line": item["line"],
+            "title": title,
+            "source": "minimalism",
+            "evidence": name,
+            "minimalism_tag": tag,
+        })
+    return findings
+
+
+def minimalism_findings(root: Path, files: list[Path], config: dict[str, Any], cli_mode: str | None = None) -> list[dict[str, Any]]:
+    mode = minimalism_mode(config, cli_mode)
+    if mode == "off":
+        return []
+    findings = dependency_minimalism_findings(root, files)
+    if mode in {"full", "ultra"}:
+        max_lines = minimalism_wrapper_max_lines(config)
+        findings.extend(python_wrapper_minimalism_findings(root, files, max_lines))
+        findings.extend(js_wrapper_minimalism_findings(root, files, max_lines))
+        findings.extend(abstraction_minimalism_findings(root, files))
     return annotate_findings(findings)
 
 
@@ -2354,6 +2608,14 @@ JURY_LENSES = {
             "Which warning represents future maintenance drag rather than immediate breakage?",
         ],
     },
+    "Minimalist": {
+        "codes": ("MIN",),
+        "sources": ("minimalism",),
+        "questions": [
+            "Does this code need to exist, or can the behavior be deleted, reused, or moved to a native feature?",
+            "Which dependency, wrapper, factory, or interface is buying future flexibility nobody uses yet?",
+        ],
+    },
 }
 
 
@@ -2478,6 +2740,7 @@ def markdown_report(session: dict[str, Any]) -> str:
         "## Configuration",
         "",
         f"Config: `{session.get('config_path') or 'default'}`",
+        f"Minimalism mode: `{session.get('minimalism', {}).get('mode', 'lite')}`",
         f"Baseline: `{session.get('baseline', {}).get('path') or 'disabled'}`",
         f"Suppressed findings: {len(suppressed)}",
         "",
@@ -2788,6 +3051,10 @@ def init_config_text(profile: dict[str, Any]) -> str:
         "  max_file_bytes: 2000000",
         "  cache: true",
         "",
+        "minimalism:",
+        "  mode: lite",
+        "  max_wrapper_lines: 4",
+        "",
         "ignore:",
         "  paths:",
         "    - dist/**",
@@ -2834,6 +3101,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-files", type=int, default=60)
     parser.add_argument("--plan", help="Optional design/plan file to cross-reference with scoped files.")
     parser.add_argument("--config", help="Optional .grill-me-code YAML/JSON config file.")
+    parser.add_argument("--minimalism", choices=["off", "lite", "full", "ultra"], help="Override the Ponytail-inspired minimalism scan mode.")
     parser.add_argument("--baseline", default=".grill-me-code/baseline.json", help="Baseline file used to suppress known findings.")
     parser.add_argument("--no-baseline", action="store_true", help="Do not read the baseline file even if it exists.")
     parser.add_argument("--write-baseline", action="store_true", help="Write or update the baseline with current findings.")
@@ -2912,6 +3180,7 @@ def main(argv: list[str]) -> int:
     learning_path = (root / args.learning_store).resolve()
     cache_path = (root / args.cache_file).resolve() if args.cache_file else out_dir / "cache.json"
     cache_enabled = not args.no_cache and bool(config.get("scan", {}).get("cache", True))
+    active_minimalism_mode = minimalism_mode(config, args.minimalism)
 
     packet_path.parent.mkdir(parents=True, exist_ok=True)
     packet_path.write_text(build_packet(root, files, mode, args.depth, "CODE-GRILL-PACKET"), encoding="utf-8")
@@ -2928,6 +3197,8 @@ def main(argv: list[str]) -> int:
     signature = scanner_signature(static_patterns)
     static_scan_findings, scan_cache, cache_stats = cached_static_findings(root, files, static_patterns, scan_cache, cache_enabled, signature, args.progress)
     raw_findings.extend(static_scan_findings)
+    minimalism_scan_findings = minimalism_findings(root, files, config, args.minimalism)
+    raw_findings.extend(minimalism_scan_findings)
     plugin_payload = {
         "root": str(root),
         "mode": mode,
@@ -3023,6 +3294,11 @@ def main(argv: list[str]) -> int:
         },
         "analysis_plugins": analysis_plugin_results,
         "reasoning": [],
+        "minimalism": {
+            "mode": active_minimalism_mode,
+            "findings": len(minimalism_scan_findings),
+            "source": "Ponytail-inspired local heuristics",
+        },
         "cache": {
             "enabled": cache_enabled,
             "path": display_path(cache_path, root),

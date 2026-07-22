@@ -53,6 +53,7 @@ When no runner is available, run the grilling loop inline using this skill.
 - For reusable prompt shapes, read `references/prompt-patterns.md`.
 - For market positioning and fork-worthy product direction, read `references/market-positioning.md`.
 - For multi-lens adversarial review, read `references/jury-mode.md`.
+- For Ponytail-inspired minimalism and shorter-code pressure, read `references/minimalist-review.md`.
 - For the runner engine and CI hooks, prefer `scripts/grill_runner.py` and `assets/github-actions/grill-me-code.yml`.
 
 ## Review Stance
@@ -67,6 +68,7 @@ Look for:
 - missing, shallow, flaky, or mis-scoped tests
 - operational risks: migrations, auth, rate limits, rollback, observability, deploy order
 - refactors that improve names but break contracts
+- unnecessary code, dependencies, wrappers, or abstractions when the user asks for a shorter path
 
 Do not flag taste as risk. Tie every serious concern to behavior, evidence, and a fix.
 
@@ -96,7 +98,8 @@ Keep outputs concise unless the user asks for a full artifact.
 - `Shiproom`: inspect release, migration, rollback, config, and observability risk.
 - `Fix Receipts`: apply fixes and produce proof commands/results.
 - `Jury Mode`: run the same scope through multiple lenses before verdict. When using the runner, tie each lens to actual findings, check results, or missing proof; when only working inline, label it as reasoning-only.
+- `Minimalist`: Ponytail-inspired pressure to delete, reuse, use stdlib/native behavior, or collapse speculative abstractions.
 
 ## Differentiator
 
-Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, config initialization, configurable static heuristics, Python AST checks, basic Python/JS taint-style checks, JS/TS alias and cross-file flow heuristics, command-use checks across common app languages, optional local security backends, assertion-quality test proof, scan limits, hash-based static cache, staged/worktree/all diff targeting, non-git repo fallback, diff-aware introduced-vs-legacy scoring, verdict bands/reasons, legacy risk levels, per-lens runner jury scores, structured check/analysis/reasoning plugins, GitHub annotations, baselines, learning records, GSD context bridging, fix loop, verification receipts, session comparison/delta, and a final ship/no-ship verdict.
+Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, config initialization, configurable static heuristics, Python AST checks, basic Python/JS taint-style checks, JS/TS alias and cross-file flow heuristics, command-use checks across common app languages, Ponytail-inspired minimalism checks, optional local security backends, assertion-quality test proof, scan limits, hash-based static cache, staged/worktree/all diff targeting, non-git repo fallback, diff-aware introduced-vs-legacy scoring, verdict bands/reasons, legacy risk levels, per-lens runner jury scores, structured check/analysis/reasoning plugins, GitHub annotations, baselines, learning records, GSD context bridging, fix loop, verification receipts, session comparison/delta, and a final ship/no-ship verdict.

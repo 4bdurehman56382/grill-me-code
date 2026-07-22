@@ -21,6 +21,7 @@ It is designed to be forkable: runner scripts with minimal dependencies, stable 
 - **Baselines and learnings:** known accepted findings can be suppressed by stable fingerprints instead of reappearing forever.
 - **Diff-aware scoring:** diff mode separates introduced findings from legacy findings and can target worktree, staged, or combined diffs.
 - **Semantic and taint heuristics:** Python AST checks, basic Python/JS taint-style reaching-definition checks, JS/TS alias heuristics, command-use heuristics for Go/Rust/Kotlin/Swift/Dart/Java/C#/PHP, and lightweight JS/TS cross-file source-to-sink signals catch some risks that plain regex misses.
+- **Ponytail-inspired minimalism:** optional `lite`, `full`, or `ultra` scans flag replaceable dependencies, tiny delegating wrappers, and speculative interfaces/factories.
 - **Test proof checks:** scoped tests are checked for detectable non-trivial assertions across common Python, JS, Java, Kotlin, Swift, Dart, Go, and Rust assertion styles.
 - **Scan limits and cache:** oversized files are reported instead of fully loaded, and unchanged files can reuse cached static findings.
 - **Runner Jury Mode:** Breaker, Security, Tester, Refactorer, Release Captain, and Maintainer each get a per-lens score.
@@ -97,6 +98,7 @@ python3 scripts/grill_runner.py --mode repo --depth deep --max-files 40 --run-ch
 python3 scripts/grill_runner.py --scope SKILL.md,scripts/grill_runner.py --plan README.md --run-checks
 python3 scripts/grill_runner.py --mode repo --run-checks --progress --jobs 8
 python3 scripts/grill_runner.py --mode repo --no-cache
+python3 scripts/grill_runner.py --mode repo --minimalism full
 python3 scripts/grill_runner.py --mode diff --reasoning-command "llm prompt --system 'Review this CODE-GRILL session JSON.'"
 python3 scripts/grill_runner.py --diff-sessions .grill-me-code/sessions/old.json .grill-me-code/latest.json
 python3 scripts/grill_runner.py --mode repo --since-session .grill-me-code/latest.json
@@ -128,6 +130,10 @@ thresholds:
 scan:
   max_file_bytes: 2000000
   cache: true
+minimalism:
+  # off, lite, full, ultra
+  mode: lite
+  max_wrapper_lines: 4
 severity_overrides:
   BUG-002: nit
 ignore:
@@ -158,6 +164,8 @@ Reasoning plugins receive the full session JSON on stdin. Plain text output is a
 
 The built-in analyzer is intentionally lightweight. It includes basic intra-file taint-style heuristics and limited cross-file JS/TS flow signals, but it is not a full call graph, production SAST, or replacement for Semgrep, CodeQL, Bandit, ESLint, type checkers, dependency scanners, or project-specific analysis plugins.
 
+The Minimalist lens is inspired by Ponytail and is scoped to complexity pressure: delete, reuse, use stdlib/native features, avoid one-implementation abstractions, and keep fixes short after the real flow is understood. See `third_party/ponytail/ATTRIBUTION.md`.
+
 The score is a transparent heuristic, not a calibrated probability. `scripts/calibrate_scores.py` runs the verdict corpus in `calibration/cases.json` so threshold changes have visible expected outcomes.
 
 ## Skill Contents
@@ -175,6 +183,7 @@ The score is a transparent heuristic, not a calibrated probability. `scripts/cal
 - `calibration/cases.json`: expected verdict cases for scoring drift checks.
 - `assets/github-actions/grill-me-code.yml`: optional CI workflow template for consumer repos.
 - `examples/`: sample packet and report artifacts.
+- `third_party/ponytail/ATTRIBUTION.md`: attribution for the Ponytail-inspired Minimalist lens.
 
 ## Validation
 
