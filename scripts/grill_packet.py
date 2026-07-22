@@ -50,7 +50,7 @@ RISK_PATTERNS = {
 
 def repo_priority(path: Path) -> tuple[int, str]:
     rel = str(path).replace("\\", "/").lower()
-    code_suffixes = (".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".sh")
+    code_suffixes = (".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".sh", ".kt", ".kts", ".swift", ".dart", ".vue", ".svelte")
     test_markers = ("/test", "/tests", "__tests__", ".test.", ".spec.")
     if any(marker in rel for marker in test_markers):
         return (0, rel)
@@ -75,6 +75,10 @@ def repo_root(start: Path) -> Path:
     return Path(output) if output else start.resolve()
 
 
+def is_git_repo(root: Path) -> bool:
+    return bool(run_git(root, "rev-parse", "--is-inside-work-tree").strip())
+
+
 def is_generated(path: Path) -> bool:
     parts = set(path.parts)
     if parts & GENERATED_DIRS:
@@ -84,13 +88,44 @@ def is_generated(path: Path) -> bool:
     return any(path.name.endswith(suffix) for suffix in GENERATED_SUFFIXES)
 
 
-def git_diff_files(root: Path, base: str | None) -> list[Path]:
+def unique_paths(paths: list[Path]) -> list[Path]:
+    seen = set()
+    output = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        output.append(path)
+    return output
+
+
+def git_diff_files(root: Path, base: str | None, diff_filter: str = "worktree") -> list[Path]:
     args = ["diff", "--name-only"]
     if base:
         args.append(base)
-    raw = run_git(root, *args)
-    files = [root / line.strip() for line in raw.splitlines() if line.strip()]
+    commands = [args]
+    if diff_filter == "staged":
+        commands = [["diff", "--cached", "--name-only"] + ([base] if base else [])]
+    elif diff_filter == "all":
+        commands = [
+            ["diff", "--name-only"] + ([base] if base else []),
+            ["diff", "--cached", "--name-only"] + ([base] if base else []),
+        ]
+    raw = "\n".join(run_git(root, *command) for command in commands)
+    files = unique_paths([root / line.strip() for line in raw.splitlines() if line.strip()])
     return [p for p in files if p.exists() and p.is_file() and not is_generated(p.relative_to(root))]
+
+
+def walk_repo_files(root: Path, limit: int) -> list[Path]:
+    files = []
+    for path in root.rglob("*"):
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        if path.is_file() and not is_generated(rel):
+            files.append(path)
+    return sorted(files, key=lambda path: repo_priority(path.relative_to(root)))[:limit]
 
 
 def git_repo_files(root: Path, limit: int) -> list[Path]:
@@ -98,6 +133,8 @@ def git_repo_files(root: Path, limit: int) -> list[Path]:
         run_git(root, "ls-files"),
         run_git(root, "ls-files", "--others", "--exclude-standard"),
     ])
+    if not raw.strip():
+        return walk_repo_files(root, limit)
     files = []
     seen = set()
     for line in raw.splitlines():
@@ -128,19 +165,24 @@ def scoped_files(root: Path, values: list[str]) -> list[Path]:
 
 def file_summary(root: Path, path: Path) -> dict[str, object]:
     rel = path.relative_to(root)
-    text = ""
+    lower_chunks = []
+    lines = 0
     try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                lines += 1
+                if len("".join(lower_chunks)) < 65536:
+                    lower_chunks.append(line.lower())
     except OSError:
         pass
-    lower = text.lower()
+    lower = "".join(lower_chunks)
     tags = []
     for tag, patterns in RISK_PATTERNS.items():
         if any(pattern.lower() in lower or pattern.lower() in str(rel).lower() for pattern in patterns):
             tags.append(tag)
     return {
         "path": str(rel),
-        "lines": len(text.splitlines()),
+        "lines": lines,
         "bytes": path.stat().st_size,
         "tags": tags or ["general"],
     }
@@ -242,6 +284,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--mode", choices=["plan", "diff", "repo", "release", "fix", "scope"], default="diff")
     parser.add_argument("--depth", choices=["quick", "standard", "deep"], default="standard")
     parser.add_argument("--base", help="Optional git diff base, such as origin/main")
+    parser.add_argument("--diff-filter", choices=["worktree", "staged", "all"], default="worktree", help="Diff source for mode=diff.")
     parser.add_argument("--scope", action="append", default=[], help="Comma-separated file paths to include. Can be repeated.")
     parser.add_argument("--max-files", type=int, default=60, help="Maximum repo files to include when mode=repo.")
     parser.add_argument("--output", default="CODE-GRILL-PACKET.md")
@@ -267,7 +310,7 @@ def main(argv: list[str]) -> int:
     elif args.mode == "repo":
         files = git_repo_files(root, args.max_files)
     else:
-        files = git_diff_files(root, args.base)
+        files = git_diff_files(root, args.base, args.diff_filter)
 
     packet = build_packet(root, files, packet_mode, args.depth, args.title)
     output = Path(args.output)

@@ -7,6 +7,7 @@ import concurrent.futures
 import datetime as dt
 from dataclasses import dataclass
 import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,9 @@ SOURCE_EXTENSIONS = {
     ".java",
     ".js",
     ".jsx",
+    ".kt",
+    ".kts",
+    ".dart",
     ".md",
     ".mjs",
     ".php",
@@ -43,8 +47,11 @@ SOURCE_EXTENSIONS = {
     ".rs",
     ".sh",
     ".sql",
+    ".svelte",
+    ".swift",
     ".ts",
     ".tsx",
+    ".vue",
     ".yaml",
     ".yml",
 }
@@ -58,6 +65,9 @@ CODE_EXTENSIONS = {
     ".java",
     ".js",
     ".jsx",
+    ".kt",
+    ".kts",
+    ".dart",
     ".mjs",
     ".php",
     ".py",
@@ -65,8 +75,11 @@ CODE_EXTENSIONS = {
     ".rs",
     ".sh",
     ".sql",
+    ".svelte",
+    ".swift",
     ".ts",
     ".tsx",
+    ".vue",
 }
 
 TEST_RELEVANT_EXTENSIONS = {
@@ -78,26 +91,35 @@ TEST_RELEVANT_EXTENSIONS = {
     ".java",
     ".js",
     ".jsx",
+    ".kt",
+    ".kts",
+    ".dart",
     ".mjs",
     ".php",
     ".py",
     ".rb",
     ".rs",
+    ".svelte",
+    ".swift",
     ".ts",
     ".tsx",
+    ".vue",
 }
 
 TEST_PATTERNS = [
     re.compile(r"(^|/)(test|tests|spec|__tests__)(/|$)", re.I),
-    re.compile(r"(\.test|\.spec)\.(js|jsx|ts|tsx|py|rb|go|rs)$", re.I),
+    re.compile(r"(\.test|\.spec)\.(js|jsx|ts|tsx|py|rb|go|rs|kt|kts|dart|swift)$", re.I),
+    re.compile(r"(\.test|\.spec)\.(vue|svelte)$", re.I),
     re.compile(r"(^|/)test_[^/]+\.py$", re.I),
     re.compile(r"(^|/)[^/]+_test\.go$", re.I),
+    re.compile(r"(^|/)[^/]+_test\.(kt|kts|dart|swift)$", re.I),
     re.compile(r"(^|/)[^/]+_(test|spec)\.rb$", re.I),
     re.compile(r"\.feature$", re.I),
 ]
 
 VALID_SEVERITIES = {"blocked", "blocker", "warning", "question", "nit"}
 SUPPRESSING_OUTCOMES = {"false_positive", "accepted_risk"}
+SCANNER_CACHE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -138,6 +160,10 @@ DEFAULT_CONFIG = {
     },
     "test_proof": {
         "mode": "code",
+    },
+    "scan": {
+        "max_file_bytes": 2000000,
+        "cache": True,
     },
     "ignore": {
         "findings": [],
@@ -272,6 +298,13 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
         config["test_proof"] = {"mode": str(test_proof)}
     config["test_proof"].setdefault("mode", "code")
 
+    scan = config.setdefault("scan", {})
+    if not isinstance(scan, dict):
+        scan = {}
+        config["scan"] = scan
+    scan.setdefault("max_file_bytes", DEFAULT_CONFIG["scan"]["max_file_bytes"])
+    scan.setdefault("cache", DEFAULT_CONFIG["scan"]["cache"])
+
     patterns = config.get("static_patterns")
     config["static_patterns"] = patterns if isinstance(patterns, list) else []
 
@@ -378,6 +411,42 @@ def needs_test_proof(files: list[Path], config: dict[str, Any]) -> bool:
     return any(is_test_relevant_file(path) for path in files)
 
 
+def scan_limit_bytes(config: dict[str, Any]) -> int:
+    try:
+        return int(config.get("scan", {}).get("max_file_bytes", DEFAULT_CONFIG["scan"]["max_file_bytes"]))
+    except (TypeError, ValueError):
+        return int(DEFAULT_CONFIG["scan"]["max_file_bytes"])
+
+
+def filter_scan_files(root: Path, files: list[Path], config: dict[str, Any]) -> tuple[list[Path], list[dict[str, Any]], list[dict[str, Any]]]:
+    max_bytes = scan_limit_bytes(config)
+    if max_bytes <= 0:
+        return files, [], []
+
+    kept = []
+    findings = []
+    skipped = []
+    for path in files:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if size <= max_bytes:
+            kept.append(path)
+            continue
+        rel = str(path.relative_to(root))
+        skipped.append({"path": rel, "bytes": size, "max_file_bytes": max_bytes})
+        findings.append({
+            "id": f"SCAN-SKIP-{len(findings) + 1:03d}",
+            "severity": "question",
+            "file": rel,
+            "title": "File skipped because it exceeds scan.max_file_bytes",
+            "source": "scan-limits",
+            "evidence": f"{size} bytes > {max_bytes} bytes",
+        })
+    return kept, annotate_findings(findings), skipped
+
+
 def is_trivial_assert_text(text: str) -> bool:
     normalized = re.sub(r"\s+", "", text.lower()).rstrip(";")
     trivial_patterns = [
@@ -408,7 +477,7 @@ def python_test_assertions(path: Path) -> tuple[int, int]:
                 trivial += 1
         elif isinstance(node, ast.Call):
             name = ast_call_name(node.func).lower()
-            if "assert" in name or name in {"pytest.raises"}:
+            if "assert" in name or name in {"pytest.raises", "pytest.warns"}:
                 assertions += 1
                 line_number = getattr(node, "lineno", 0) or 0
                 evidence = lines[line_number - 1] if 0 < line_number <= len(lines) else ""
@@ -420,9 +489,15 @@ def python_test_assertions(path: Path) -> tuple[int, int]:
 def test_assertion_metrics(root: Path, files: list[Path]) -> dict[str, Any]:
     assertion_patterns = [
         re.compile(r"\bexpect\s*\(", re.I),
+        re.compile(r"\bexpect\s*\([^)]*\)\s*\.\s*(?:resolves|rejects|toThrow|toThrowError|toEqual|toBe|toContain|toMatch)", re.I),
         re.compile(r"\bassert(?:\.\w+)?\s*\(", re.I),
-        re.compile(r"\b(?:strictEqual|deepEqual|equal)\s*\(", re.I),
-        re.compile(r"\b(?:t\.Fatal|t\.Error|assert_eq!|assert!)\s*\(", re.I),
+        re.compile(r"\b(?:strictEqual|deepEqual|equal|assertThat|assertEquals|assertThrows)\s*\(", re.I),
+        re.compile(r"\b(?:t\.(?:is|true|false|deepEqual|throws|notThrows|Fatal|Error)|assert_eq!|assert!)\s*\(", re.I),
+        re.compile(r"\.should\.(?:equal|eql|include|throw|be)\b", re.I),
+        re.compile(r"\b(?:XCTAssert|XCTAssertEqual|XCTAssertThrowsError|XCTAssertTrue|XCTAssertFalse)\s*\(", re.I),
+        re.compile(r"\b(?:assertFailsWith|assertEquals|assertTrue|assertFalse)\s*\(", re.I),
+        re.compile(r"\bexpect\s*\([^)]*,\s*(?:equals|isTrue|isFalse|throwsA|completion)", re.I),
+        re.compile(r"\bpytest\.(?:raises|warns)\s*\(", re.I),
     ]
     metrics = {
         "test_files": 0,
@@ -467,20 +542,12 @@ def resolve_files(root: Path, args: argparse.Namespace) -> tuple[str, list[Path]
     elif mode == "repo":
         files = git_repo_files(root, args.max_files)
     else:
-        files = git_diff_files(root, args.base)
+        files = git_diff_files(root, args.base, args.diff_filter)
     files = [path for path in files if path.suffix in SOURCE_EXTENSIONS or path.name in {"Dockerfile", "Makefile"}]
     return mode, files
 
 
-def git_changed_lines(root: Path, base: str | None) -> dict[str, set[int]]:
-    command = ["git", "-C", str(root), "diff", "--unified=0"]
-    if base:
-        command.append(base)
-    try:
-        raw = subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
-        return {}
-
+def parse_changed_lines(raw: str) -> dict[str, set[int]]:
     changed: dict[str, set[int]] = {}
     current_file = ""
     for line in raw.splitlines():
@@ -502,6 +569,35 @@ def git_changed_lines(root: Path, base: str | None) -> dict[str, set[int]]:
             continue
         changed[current_file].update(range(start, start + count))
     return {path: lines for path, lines in changed.items() if lines}
+
+
+def merge_changed_lines(items: list[dict[str, set[int]]]) -> dict[str, set[int]]:
+    merged: dict[str, set[int]] = {}
+    for item in items:
+        for path, lines in item.items():
+            merged.setdefault(path, set()).update(lines)
+    return {path: lines for path, lines in merged.items() if lines}
+
+
+def git_diff_output(root: Path, base: str | None, diff_filter: str) -> str:
+    command = ["git", "-C", str(root), "diff", "--unified=0"]
+    if diff_filter == "staged":
+        command.append("--cached")
+    if base:
+        command.append(base)
+    try:
+        return subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def git_changed_lines(root: Path, base: str | None, diff_filter: str = "worktree") -> dict[str, set[int]]:
+    if diff_filter == "all":
+        return merge_changed_lines([
+            parse_changed_lines(git_diff_output(root, base, "worktree")),
+            parse_changed_lines(git_diff_output(root, base, "staged")),
+        ])
+    return parse_changed_lines(git_diff_output(root, base, diff_filter))
 
 
 def annotate_diff_status(findings: list[dict[str, Any]], changed_lines: dict[str, set[int]]) -> list[dict[str, Any]]:
@@ -680,7 +776,7 @@ def comment_stripped_surface(path: Path, line: str) -> str:
     suffix = path.suffix.lower()
     if suffix in {".py", ".sh", ".rb"} and stripped.startswith("#"):
         return ""
-    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".java", ".go", ".rs", ".c", ".cc", ".cpp", ".cs", ".php"}:
+    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".java", ".go", ".rs", ".c", ".cc", ".cpp", ".cs", ".php", ".kt", ".kts", ".dart", ".swift", ".vue", ".svelte"}:
         if stripped.startswith(("//", "/*", "*")):
             return ""
     return line
@@ -691,7 +787,7 @@ def todo_comment_surface(path: Path, line: str) -> str:
     suffix = path.suffix.lower()
     if suffix in {".py", ".sh", ".rb", ".yaml", ".yml"} and stripped.startswith("#"):
         return stripped
-    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".java", ".go", ".rs", ".c", ".cc", ".cpp", ".cs", ".php", ".css"}:
+    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".java", ".go", ".rs", ".c", ".cc", ".cpp", ".cs", ".php", ".css", ".kt", ".kts", ".dart", ".swift", ".vue", ".svelte"}:
         if stripped.startswith(("//", "/*", "*")):
             return stripped
     return ""
@@ -842,7 +938,7 @@ def compiled_language_semantic_findings(root: Path, files: list[Path]) -> list[d
     findings = []
     ordinal = 1
     for path in files:
-        if path.suffix not in {".go", ".rs"}:
+        if path.suffix not in {".go", ".rs", ".kt", ".kts", ".swift", ".dart"}:
             continue
         rel = str(path.relative_to(root))
         try:
@@ -857,6 +953,12 @@ def compiled_language_semantic_findings(root: Path, files: list[Path]) -> list[d
                 title = "Go exec.Command usage needs argument containment proof."
             elif path.suffix == ".rs" and re.search(r"\b(?:Command::new|std::process::Command::new)\s*\(", surface):
                 title = "Rust process Command usage needs argument containment proof."
+            elif path.suffix in {".kt", ".kts"} and re.search(r"\b(?:ProcessBuilder|Runtime\.getRuntime\(\)\.exec)\s*\(", surface):
+                title = "Kotlin process execution needs argument containment proof."
+            elif path.suffix == ".swift" and re.search(r"\bProcess\s*\(", surface):
+                title = "Swift Process usage needs argument containment proof."
+            elif path.suffix == ".dart" and re.search(r"\bProcess\.(?:run|start|runSync|startDetached)\s*\(", surface):
+                title = "Dart process execution needs argument containment proof."
             else:
                 continue
             findings.append({
@@ -872,7 +974,145 @@ def compiled_language_semantic_findings(root: Path, files: list[Path]) -> list[d
     return annotate_findings(findings)
 
 
-def static_findings(root: Path, files: list[Path], patterns: list[StaticPattern] | None = None) -> list[dict[str, Any]]:
+JS_MODULE_EXTENSIONS = {".js", ".jsx", ".mjs", ".ts", ".tsx", ".vue", ".svelte"}
+SOURCE_LIKE_RE = re.compile(r"\b(?:req|request|ctx|context|event|params|query|body|input|argv|stdin|cookie|headers)\b", re.I)
+SINK_LIKE_RE = re.compile(r"\b(?:eval|exec|execSync|spawn|spawnSync|os\.system|subprocess\.|ProcessBuilder|Process\.(?:run|start))\s*\(", re.I)
+
+
+def resolve_js_module(root: Path, current: Path, specifier: str, rel_paths: set[str]) -> str:
+    if not specifier.startswith("."):
+        return ""
+    base = (current.parent / specifier).resolve()
+    candidates = []
+    for suffix in JS_MODULE_EXTENSIONS:
+        candidates.append(base.with_suffix(suffix))
+    for suffix in JS_MODULE_EXTENSIONS:
+        candidates.append(base / f"index{suffix}")
+    for candidate in candidates:
+        try:
+            rel = str(candidate.relative_to(root))
+        except ValueError:
+            continue
+        if rel in rel_paths:
+            return rel
+    return ""
+
+
+def sink_functions_in_file(path: Path) -> dict[str, int]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return {}
+    functions: dict[str, int] = {}
+    current_name = ""
+    current_start = 0
+    brace_depth = 0
+    saw_sink = False
+    function_pattern = re.compile(r"\b(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\b|\b(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>")
+    for line_number, line in enumerate(lines, start=1):
+        surface = comment_stripped_surface(path, line)
+        if not surface:
+            continue
+        match = function_pattern.search(surface)
+        if match:
+            current_name = match.group(1) or match.group(2) or ""
+            current_start = line_number
+            brace_depth = surface.count("{") - surface.count("}")
+            saw_sink = bool(SINK_LIKE_RE.search(surface))
+            if saw_sink:
+                functions[current_name] = current_start
+            if brace_depth <= 0:
+                current_name = ""
+            continue
+        if not current_name:
+            continue
+        if SINK_LIKE_RE.search(surface):
+            saw_sink = True
+            functions[current_name] = current_start
+        brace_depth += surface.count("{") - surface.count("}")
+        if brace_depth <= 0:
+            current_name = ""
+            saw_sink = False
+    return functions
+
+
+def imported_js_names(root: Path, path: Path, rel_paths: set[str]) -> dict[str, str]:
+    imports = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return imports
+    for line in lines:
+        surface = comment_stripped_surface(path, line)
+        if not surface:
+            continue
+        import_match = re.search(r"import\s+\{\s*([^}]+)\s*\}\s+from\s+['\"]([^'\"]+)['\"]", surface)
+        if import_match:
+            target = resolve_js_module(root, path, import_match.group(2), rel_paths)
+            if not target:
+                continue
+            for part in import_match.group(1).split(","):
+                name = part.strip()
+                if not name:
+                    continue
+                local = name.split(" as ", 1)[1].strip() if " as " in name else name
+                imports[local] = target
+        require_match = re.search(r"\{\s*([^}]+)\s*\}\s*=\s*require\(\s*['\"]([^'\"]+)['\"]\s*\)", surface)
+        if require_match:
+            target = resolve_js_module(root, path, require_match.group(2), rel_paths)
+            if not target:
+                continue
+            for part in require_match.group(1).split(","):
+                name = part.strip()
+                if not name:
+                    continue
+                local = name.split(":", 1)[1].strip() if ":" in name else name
+                imports[local] = target
+    return imports
+
+
+def cross_file_flow_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    js_files = [path for path in files if path.suffix in JS_MODULE_EXTENSIONS]
+    rel_paths = {str(path.relative_to(root)) for path in js_files}
+    sink_index = {
+        str(path.relative_to(root)): sink_functions_in_file(path)
+        for path in js_files
+    }
+    sink_index = {rel: sinks for rel, sinks in sink_index.items() if sinks}
+    if not sink_index:
+        return []
+
+    findings = []
+    for path in js_files:
+        rel = str(path.relative_to(root))
+        imports = imported_js_names(root, path, rel_paths)
+        if not imports:
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line_number, line in enumerate(lines, start=1):
+            surface = comment_stripped_surface(path, line)
+            if not surface or not SOURCE_LIKE_RE.search(surface):
+                continue
+            for local, target in imports.items():
+                if local not in sink_index.get(target, {}):
+                    continue
+                if re.search(rf"\b{re.escape(local)}\s*\(", surface):
+                    findings.append({
+                        "id": f"FLOW-001-{len(findings) + 1:03d}",
+                        "severity": "warning",
+                        "file": rel,
+                        "line": line_number,
+                        "title": "Request-like input crosses into an imported sink wrapper",
+                        "source": "cross-file-flow",
+                        "evidence": line.strip()[:240],
+                    })
+    return annotate_findings(findings)
+
+
+def regex_static_findings(root: Path, files: list[Path], patterns: list[StaticPattern] | None = None) -> list[dict[str, Any]]:
     patterns = patterns or list(BUILTIN_STATIC_PATTERNS)
     findings = []
     ordinal = 1
@@ -899,6 +1139,8 @@ def static_findings(root: Path, files: list[Path], patterns: list[StaticPattern]
                     scan_line = surface if rule.include_strings and not is_test_file(path) else code_surface
                 if rule.code == "SEC-007" and "try" in context:
                     continue
+                if rule.code == "SEC-008" and re.search(r"\b(?:sha256|cache|cached)\b", surface, re.I):
+                    continue
                 if rule.pattern.search(scan_line):
                     findings.append({
                         "id": f"{rule.code}-{ordinal:03d}",
@@ -910,10 +1152,125 @@ def static_findings(root: Path, files: list[Path], patterns: list[StaticPattern]
                         "source": rule.source,
                     })
                     ordinal += 1
+    return annotate_findings(findings)
+
+
+def raw_static_findings(root: Path, files: list[Path], patterns: list[StaticPattern] | None = None) -> list[dict[str, Any]]:
+    findings = regex_static_findings(root, files, patterns)
     findings.extend(python_ast_findings(root, files))
     findings.extend(javascript_semantic_findings(root, files))
     findings.extend(compiled_language_semantic_findings(root, files))
-    return combine_same_line_findings(annotate_findings(findings))
+    return annotate_findings(findings)
+
+
+def scan_id_prefix(finding: dict[str, Any]) -> str:
+    code = str(finding.get("code") or finding_code(finding))
+    source = str(finding.get("source", ""))
+    if source == "python-ast":
+        return f"{code}-AST"
+    if source == "js-semantic":
+        return f"{code}-JS"
+    if source == "compiled-semantic":
+        return f"{code}-COMPILED"
+    if source == "cross-file-flow":
+        return f"{code}-FLOW"
+    return code
+
+
+def renumber_scan_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counters: dict[str, int] = {}
+    for finding in findings:
+        prefix = scan_id_prefix(finding)
+        counters[prefix] = counters.get(prefix, 0) + 1
+        finding["id"] = f"{prefix}-{counters[prefix]:03d}"
+    return annotate_findings(findings)
+
+
+def static_findings(root: Path, files: list[Path], patterns: list[StaticPattern] | None = None) -> list[dict[str, Any]]:
+    findings = raw_static_findings(root, files, patterns)
+    findings.extend(cross_file_flow_findings(root, files))
+    return renumber_scan_findings(combine_same_line_findings(findings))
+
+
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def scanner_signature(patterns: list[StaticPattern]) -> str:
+    payload = {
+        "version": SCANNER_CACHE_VERSION,
+        "patterns": [
+            {
+                "severity": item.severity,
+                "code": item.code,
+                "regex": item.pattern.pattern,
+                "title": item.title,
+                "include_strings": item.include_strings,
+                "source": item.source,
+            }
+            for item in patterns
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def load_scan_cache(path: Path, enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {"version": SCANNER_CACHE_VERSION, "files": {}}
+    data = read_json(path)
+    if data.get("version") != SCANNER_CACHE_VERSION or not isinstance(data.get("files"), dict):
+        return {"version": SCANNER_CACHE_VERSION, "files": {}}
+    return data
+
+
+def cached_static_findings(
+    root: Path,
+    files: list[Path],
+    patterns: list[StaticPattern],
+    cache: dict[str, Any],
+    cache_enabled: bool,
+    signature: str,
+    progress: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, int]]:
+    if not cache_enabled:
+        return static_findings(root, files, patterns), cache, {"hits": 0, "misses": len(files), "written": 0}
+
+    entries = cache.setdefault("files", {})
+    findings = []
+    stats = {"hits": 0, "misses": 0, "written": 0}
+    for path in files:
+        rel = str(path.relative_to(root))
+        digest = file_digest(path)
+        cached = entries.get(rel) if digest else None
+        if isinstance(cached, dict) and cached.get("sha256") == digest and cached.get("signature") == signature:
+            findings.extend(cached.get("findings", []))
+            stats["hits"] += 1
+            continue
+        emit_progress(progress, f"scanning {rel}")
+        file_findings = raw_static_findings(root, [path], patterns)
+        findings.extend(file_findings)
+        if digest:
+            entries[rel] = {
+                "sha256": digest,
+                "signature": signature,
+                "bytes": path.stat().st_size,
+                "findings": file_findings,
+            }
+            stats["written"] += 1
+        stats["misses"] += 1
+    live = {str(path.relative_to(root)) for path in files}
+    for rel in list(entries):
+        if rel not in live:
+            entries.pop(rel, None)
+    findings.extend(cross_file_flow_findings(root, files))
+    return renumber_scan_findings(combine_same_line_findings(annotate_findings(findings))), cache, stats
 
 
 def syntax_commands(root: Path, files: list[Path]) -> list[dict[str, Any]]:
@@ -986,6 +1343,28 @@ def command_available(root: Path, command: list[str]) -> bool:
     return bool(shutil.which(executable))
 
 
+def package_has_dependency(root: Path, name: str) -> bool:
+    package = read_json(root / "package.json")
+    for key in ["dependencies", "devDependencies", "optionalDependencies"]:
+        deps = package.get(key)
+        if isinstance(deps, dict) and name in deps:
+            return True
+    return False
+
+
+def command_missing_reason(root: Path, command: list[str]) -> str:
+    if not command_available(root, command):
+        return f"command is not available: {command[0] if command else '<empty>'}"
+    if command and command[0] == "npx" and len(command) > 1 and not command[1].startswith("-"):
+        tool = command[1]
+        package_name = tool if not tool.startswith("@") else "/".join(tool.split("/")[:2])
+        executable = package_name.split("/")[-1]
+        local_bin = root / "node_modules" / ".bin" / (f"{executable}.cmd" if os.name == "nt" else executable)
+        if not local_bin.exists() and not package_has_dependency(root, package_name):
+            return f"npx is available but {package_name} is not installed in package.json or node_modules/.bin"
+    return ""
+
+
 def make_check(name: str, command: list[str], kind: str, source: str = "discovered", missing_reason: str = "") -> dict[str, Any]:
     available = not missing_reason
     return {
@@ -1056,14 +1435,103 @@ def plugin_unavailable_finding(plugin: dict[str, Any], prefix: str, ordinal: int
     }
 
 
+def parse_plugin_output(output: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    text = output.strip()
+    if not text:
+        return [], [], ""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        findings = []
+        events = []
+        bad_lines = 0
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                bad_lines += 1
+                continue
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in {"progress", "event"} or "progress" in item:
+                events.append(item)
+            elif isinstance(item.get("finding"), dict):
+                findings.append(item["finding"])
+            elif any(key in item for key in ["id", "severity", "title"]):
+                findings.append(item)
+        if findings or events:
+            return findings, events, ""
+        return [], [], f"output was not JSON or JSONL ({bad_lines or 1} unparsable line(s))"
+
+    if isinstance(parsed, dict):
+        events = parsed.get("events", [])
+        if not isinstance(events, list):
+            events = []
+        plugin_findings = parsed.get("findings", [])
+        if isinstance(plugin_findings, dict):
+            plugin_findings = [plugin_findings]
+    else:
+        events = []
+        plugin_findings = parsed
+    if not isinstance(plugin_findings, list):
+        return [], events, "findings must be a list"
+    return [item for item in plugin_findings if isinstance(item, dict)], events, ""
+
+
+def normalize_plugin_finding(root: Path, item: dict[str, Any], plugin: dict[str, Any], plugin_index: int, finding_index: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    finding = dict(item)
+    warnings = []
+    finding.setdefault("id", f"PLUGIN-{plugin_index:03d}-{finding_index:03d}")
+    severity = str(finding.get("severity", "question")).lower()
+    if severity not in VALID_SEVERITIES - {"blocked"}:
+        warnings.append({
+            "id": f"ANALYSIS-SCHEMA-{plugin_index:03d}",
+            "severity": "question",
+            "title": f"Analysis plugin returned invalid severity: {plugin.get('name')}",
+            "source": "analysis-plugin",
+            "evidence": str(finding.get("severity", ""))[:240],
+        })
+        severity = "question"
+    finding["severity"] = severity
+    finding.setdefault("title", f"Analysis plugin finding from {plugin['name']}")
+    finding.setdefault("source", f"analysis-plugin:{plugin['name']}")
+    if finding.get("file"):
+        candidate = (root / str(finding["file"])).resolve()
+        try:
+            rel = str(candidate.relative_to(root.resolve()))
+        except ValueError:
+            warnings.append({
+                "id": f"ANALYSIS-SCHEMA-PATH-{plugin_index:03d}",
+                "severity": "question",
+                "title": f"Analysis plugin returned a file path outside the repo: {plugin.get('name')}",
+                "source": "analysis-plugin",
+                "evidence": str(finding.get("file", ""))[:240],
+            })
+            finding.pop("file", None)
+            finding.pop("line", None)
+        else:
+            finding["file"] = rel
+    if finding.get("line") is not None:
+        try:
+            finding["line"] = int(finding["line"])
+        except (TypeError, ValueError):
+            finding.pop("line", None)
+    return finding, warnings
+
+
 def run_analysis_plugins(root: Path, plugins: list[dict[str, Any]], payload: dict[str, Any], timeout: int, progress: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     findings = []
     plugin_results = []
     for index, plugin in enumerate(plugins, start=1):
         command = plugin["command"]
-        if not command_available(root, command):
-            findings.append(plugin_unavailable_finding(plugin, "ANALYSIS", index))
-            plugin_results.append({"name": plugin["name"], "ok": False, "missing": True})
+        missing = command_missing_reason(root, command)
+        if missing:
+            finding = plugin_unavailable_finding(plugin, "ANALYSIS", index)
+            finding["evidence"] = missing
+            findings.append(finding)
+            plugin_results.append({"name": plugin["name"], "ok": False, "missing": True, "missing_reason": missing})
             continue
         emit_progress(progress, f"running analysis plugin {plugin['name']}")
         started = utc_now()
@@ -1087,7 +1555,7 @@ def run_analysis_plugins(root: Path, plugins: list[dict[str, Any]], payload: dic
             })
             plugin_results.append({"name": plugin["name"], "ok": False, "timed_out": True})
             continue
-        plugin_results.append({"name": plugin["name"], "ok": proc.returncode == 0, "returncode": proc.returncode, "started": started})
+        plugin_results.append({"name": plugin["name"], "ok": proc.returncode == 0, "returncode": proc.returncode, "started": started, "events": 0})
         if proc.returncode != 0:
             findings.append({
                 "id": f"ANALYSIS-FAILED-{index:03d}",
@@ -1097,28 +1565,24 @@ def run_analysis_plugins(root: Path, plugins: list[dict[str, Any]], payload: dic
                 "evidence": proc.stdout[-240:],
             })
             continue
-        try:
-            parsed = json.loads(proc.stdout or "[]")
-        except json.JSONDecodeError:
+        plugin_findings, events, parse_error = parse_plugin_output(proc.stdout or "[]")
+        plugin_results[-1]["events"] = len(events)
+        for event in events:
+            if event.get("progress"):
+                emit_progress(progress, f"{plugin['name']}: {event.get('progress')}")
+        if parse_error:
             findings.append({
                 "id": f"ANALYSIS-BADJSON-{index:03d}",
                 "severity": "question",
                 "title": f"Analysis plugin did not return JSON: {plugin['name']}",
                 "source": "analysis-plugin",
-                "evidence": proc.stdout[-240:],
+                "evidence": parse_error,
             })
             continue
-        plugin_findings = parsed.get("findings", parsed) if isinstance(parsed, dict) else parsed
-        if not isinstance(plugin_findings, list):
-            continue
-        for item in plugin_findings:
-            if not isinstance(item, dict):
-                continue
-            item.setdefault("id", f"PLUGIN-{index:03d}-{len(findings) + 1:03d}")
-            item.setdefault("severity", "question")
-            item.setdefault("title", f"Analysis plugin finding from {plugin['name']}")
-            item.setdefault("source", f"analysis-plugin:{plugin['name']}")
-            findings.append(item)
+        for finding_index, item in enumerate(plugin_findings, start=1):
+            normalized, schema_warnings = normalize_plugin_finding(root, item, plugin, index, finding_index)
+            findings.extend(schema_warnings)
+            findings.append(normalized)
     return annotate_findings(findings), plugin_results
 
 
@@ -1127,9 +1591,12 @@ def run_reasoning_plugins(root: Path, plugins: list[dict[str, Any]], session: di
     findings = []
     for index, plugin in enumerate(plugins, start=1):
         command = plugin["command"]
-        if not command_available(root, command):
-            findings.append(plugin_unavailable_finding(plugin, "REASONING", index))
-            outputs.append({"name": plugin["name"], "ok": False, "missing": True})
+        missing = command_missing_reason(root, command)
+        if missing:
+            finding = plugin_unavailable_finding(plugin, "REASONING", index)
+            finding["evidence"] = missing
+            findings.append(finding)
+            outputs.append({"name": plugin["name"], "ok": False, "missing": True, "missing_reason": missing})
             continue
         emit_progress(progress, f"running reasoning plugin {plugin['name']}")
         try:
@@ -1233,6 +1700,25 @@ def discover_project_checks(root: Path, config: dict[str, Any] | None = None) ->
         missing = "" if shutil.which("cargo") else "Cargo.toml found but cargo is not installed"
         checks.append(make_check("cargo:test", ["cargo", "test"], "test", "Cargo.toml", missing))
 
+    if any((root / name).exists() for name in ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]):
+        gradlew = root / ("gradlew.bat" if os.name == "nt" else "gradlew")
+        if gradlew.exists():
+            checks.append(make_check("gradle:test", [str(gradlew), "test"], "test", "gradle"))
+        else:
+            missing = "" if shutil.which("gradle") else "Gradle project found but gradle/gradlew is not available"
+            checks.append(make_check("gradle:test", ["gradle", "test"], "test", "gradle", missing))
+
+    if (root / "Package.swift").exists():
+        missing = "" if shutil.which("swift") else "Package.swift found but swift is not installed"
+        checks.append(make_check("swift:test", ["swift", "test"], "test", "Package.swift", missing))
+
+    if (root / "pubspec.yaml").exists():
+        if shutil.which("flutter"):
+            checks.append(make_check("flutter:test", ["flutter", "test"], "test", "pubspec.yaml"))
+        else:
+            missing = "" if shutil.which("dart") else "pubspec.yaml found but neither flutter nor dart is installed"
+            checks.append(make_check("dart:test", ["dart", "test"], "test", "pubspec.yaml", missing))
+
     composer = read_json(root / "composer.json")
     composer_scripts = composer.get("scripts") if isinstance(composer, dict) else {}
     if isinstance(composer_scripts, dict) and "test" in composer_scripts:
@@ -1249,9 +1735,10 @@ def discover_project_checks(root: Path, config: dict[str, Any] | None = None) ->
 
     plugin_checks, _ = configured_check_plugins(config)
     for item in plugin_checks:
-        if not command_available(root, item["command"]):
+        missing = command_missing_reason(root, item["command"])
+        if missing:
             item["available"] = False
-            item["missing_reason"] = f"Configured check {item['name']} command is not available: {item['command'][0]}"
+            item["missing_reason"] = f"Configured check {item['name']} {missing}"
         checks.append(item)
 
     return checks
@@ -1409,28 +1896,66 @@ def score_session(
     legacy_blockers = sum(1 for finding in legacy_findings if finding.get("severity") == "blocker")
     code_blockers = introduced_blockers if diff_aware else severity_counts.get("blocker", 0)
     blocked = severity_counts.get("blocked", 0)
+    verdict_reasons = []
     if not files:
         verdict = "BLOCKED"
+        verdict_reasons.append("no files were available for review")
     elif code_blockers > 0 or failed_checks:
         verdict = "DO NOT SHIP"
+        if code_blockers > 0:
+            verdict_reasons.append(f"{code_blockers} introduced/scope blocker finding(s)")
+        if failed_checks:
+            verdict_reasons.append(f"{len(failed_checks)} failed check(s)")
     elif blocked > 0:
         verdict = "BLOCKED"
+        verdict_reasons.append(f"{blocked} setup/configuration blocked finding(s)")
     elif diff_aware and legacy_blockers:
         verdict = "SHIP WITH RISKS"
+        verdict_reasons.append(f"{legacy_blockers} legacy blocker finding(s) remain outside changed lines")
     elif risk >= int(thresholds.get("ship_with_risks_risk", 35)) or proof < int(thresholds.get("min_proof_ship", 60)):
         verdict = "SHIP WITH RISKS"
+        if risk >= int(thresholds.get("ship_with_risks_risk", 35)):
+            verdict_reasons.append(f"risk score {risk} meets ship-with-risks threshold")
+        if proof < int(thresholds.get("min_proof_ship", 60)):
+            verdict_reasons.append(f"proof score {proof} is below ship threshold")
     else:
         verdict = "SHIP"
+        verdict_reasons.append("risk and proof scores are inside configured ship thresholds")
+
+    if risk >= 80:
+        risk_band = "critical"
+    elif risk >= 50:
+        risk_band = "high"
+    elif risk >= 20:
+        risk_band = "moderate"
+    elif risk > 0:
+        risk_band = "low"
+    else:
+        risk_band = "none"
+
+    if proof >= 80:
+        proof_band = "strong"
+    elif proof >= 60:
+        proof_band = "adequate"
+    elif proof >= 30:
+        proof_band = "weak"
+    elif proof > 0:
+        proof_band = "thin"
+    else:
+        proof_band = "missing"
 
     return {
         "risk_score": risk,
+        "risk_band": risk_band,
         "introduced_risk_score": min(100, introduced_risk + check_risk),
         "legacy_risk_score": min(100, legacy_risk),
         "legacy_risk_level": legacy_risk_level,
         "total_risk_score": total_risk,
         "proof_score": proof,
+        "proof_band": proof_band,
         "ship_score": ship_score,
         "verdict": verdict,
+        "verdict_reasons": verdict_reasons,
         "severity_counts": severity_counts,
         "introduced_findings": len(introduced_findings),
         "legacy_findings": len(legacy_findings),
@@ -1576,25 +2101,42 @@ def markdown_report(session: dict[str, Any]) -> str:
         "## Verdict",
         "",
         f"Decision: **{score['verdict']}**",
-        f"Risk score: **{score['risk_score']}/100**",
+        f"Risk score: **{score['risk_score']}/100** ({score.get('risk_band', 'unknown')})",
         f"Introduced risk: **{score.get('introduced_risk_score', score['risk_score'])}/100**",
         f"Legacy risk: **{score.get('legacy_risk_score', 0)}/100**",
         f"Legacy risk level: **{score.get('legacy_risk_level', 'none')}**",
         f"Total risk: **{score.get('total_risk_score', score['risk_score'])}/100**",
-        f"Proof score: **{score['proof_score']}/100**",
+        f"Proof score: **{score['proof_score']}/100** ({score.get('proof_band', 'unknown')})",
         f"Ship score: **{score['ship_score']}/100**",
+        "",
+        "### Verdict Reasons",
+        "",
+        *[f"- {reason}" for reason in score.get("verdict_reasons", [])],
         "",
         "## Scope",
         "",
         f"Files reviewed: {len(session['files'])}",
         *[f"- `{path}`" for path in session["files"]],
         "",
+        "## Scan Limits",
+        "",
+        f"Skipped files: {len(session.get('skipped_files', []))}",
+        *[f"- `{item.get('path')}` ({item.get('bytes')} bytes > {item.get('max_file_bytes')})" for item in session.get("skipped_files", [])],
+        "",
         "## Diff Awareness",
         "",
         f"Diff-aware scoring: `{score.get('diff_aware', False)}`",
+        f"Diff filter: `{session.get('diff_filter', 'worktree')}`",
         f"Changed-line files: {len(session.get('changed_lines', {}))}",
         f"Introduced findings: {score.get('introduced_findings', 0)}",
         f"Legacy findings: {score.get('legacy_findings', 0)}",
+        "",
+        "## Cache",
+        "",
+        f"Enabled: `{session.get('cache', {}).get('enabled', False)}`",
+        f"Path: `{session.get('cache', {}).get('path', '')}`",
+        f"Hits: {session.get('cache', {}).get('hits', 0)}",
+        f"Misses: {session.get('cache', {}).get('misses', 0)}",
         "",
         "## Configuration",
         "",
@@ -1778,6 +2320,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--mode", choices=["plan", "diff", "repo", "release", "fix", "scope"], default="diff")
     parser.add_argument("--depth", choices=["quick", "standard", "deep"], default="standard")
     parser.add_argument("--base", help="Optional git diff base, such as origin/main")
+    parser.add_argument("--diff-filter", choices=["worktree", "staged", "all"], default="worktree", help="Diff source for mode=diff.")
     parser.add_argument("--scope", action="append", default=[], help="Comma-separated file paths. Can be repeated.")
     parser.add_argument("--max-files", type=int, default=60)
     parser.add_argument("--plan", help="Optional design/plan file to cross-reference with scoped files.")
@@ -1789,6 +2332,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--gsd-phase", help="Optional GSD phase prefix to include from .planning/phases.")
     parser.add_argument("--run-checks", action="store_true", help="Run discovered project lint/type/test/security checks.")
     parser.add_argument("--reasoning-command", action="append", default=[], help="Command that receives session JSON on stdin and returns reasoning text. Can be repeated.")
+    parser.add_argument("--cache-file", help="Static scan cache path. Defaults to <output-dir>/cache.json.")
+    parser.add_argument("--no-cache", action="store_true", help="Disable static scan cache reads and writes.")
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per command in seconds.")
     parser.add_argument("--jobs", type=int, default=max(1, min(8, os.cpu_count() or 1)), help="Parallel syntax-check worker count.")
     parser.add_argument("--progress", action="store_true", help="Print incremental progress to stderr while checks run.")
@@ -1839,7 +2384,8 @@ def main(argv: list[str]) -> int:
     for index, command_text in enumerate(args.reasoning_command, start=1):
         reasoning_plugins.append({"name": f"cli-reasoning-{index}", "command": shlex.split(command_text), "kind": "reasoning", "source": "cli"})
     mode, files = resolve_files(root, args)
-    changed_lines = git_changed_lines(root, args.base) if mode == "diff" else {}
+    files, scan_limit_findings, skipped_files = filter_scan_files(root, files, config)
+    changed_lines = git_changed_lines(root, args.base, args.diff_filter) if mode == "diff" else {}
     diff_aware = bool(changed_lines)
     emit_progress(args.progress, f"resolved {len(files)} file(s) in {mode} mode")
     generated = utc_now()
@@ -1850,6 +2396,8 @@ def main(argv: list[str]) -> int:
     report_path = out_dir / "CODE-GRILL-REPORT.md"
     baseline_path = (root / args.baseline).resolve()
     learning_path = (root / args.learning_store).resolve()
+    cache_path = (root / args.cache_file).resolve() if args.cache_file else out_dir / "cache.json"
+    cache_enabled = not args.no_cache and bool(config.get("scan", {}).get("cache", True))
 
     packet_path.parent.mkdir(parents=True, exist_ok=True)
     packet_path.write_text(build_packet(root, files, mode, args.depth, "CODE-GRILL-PACKET"), encoding="utf-8")
@@ -1861,12 +2409,17 @@ def main(argv: list[str]) -> int:
     raw_findings.extend(check_config_findings)
     raw_findings.extend(analysis_config_findings)
     raw_findings.extend(reasoning_config_findings)
-    raw_findings.extend(static_findings(root, files, static_patterns))
+    raw_findings.extend(scan_limit_findings)
+    scan_cache = load_scan_cache(cache_path, cache_enabled)
+    signature = scanner_signature(static_patterns)
+    static_scan_findings, scan_cache, cache_stats = cached_static_findings(root, files, static_patterns, scan_cache, cache_enabled, signature, args.progress)
+    raw_findings.extend(static_scan_findings)
     plugin_payload = {
         "root": str(root),
         "mode": mode,
         "depth": args.depth,
         "files": [str(path.relative_to(root)) for path in files],
+        "skipped_files": skipped_files,
         "changed_lines": {path: sorted(lines) for path, lines in changed_lines.items()},
     }
     analysis_plugin_findings, analysis_plugin_results = run_analysis_plugins(root, analysis_plugins, plugin_payload, min(args.timeout, 60), args.progress)
@@ -1936,7 +2489,9 @@ def main(argv: list[str]) -> int:
         "mode": mode,
         "depth": args.depth,
         "config_path": config_path,
+        "diff_filter": args.diff_filter,
         "files": [str(path.relative_to(root)) for path in files],
+        "skipped_files": skipped_files,
         "code_files": code_files,
         "test_files": test_files,
         "test_relevant_files": test_relevant_files,
@@ -1954,6 +2509,11 @@ def main(argv: list[str]) -> int:
         },
         "analysis_plugins": analysis_plugin_results,
         "reasoning": [],
+        "cache": {
+            "enabled": cache_enabled,
+            "path": display_path(cache_path, root),
+            **cache_stats,
+        },
         "baseline": {
             "path": "" if args.no_baseline else display_path(baseline_path, root),
             "read": baseline_was_read,
@@ -1981,6 +2541,8 @@ def main(argv: list[str]) -> int:
         session["reasoning"] = reasoning_outputs
 
     report_path.write_text(markdown_report(session), encoding="utf-8")
+    if cache_enabled:
+        write_json(cache_path, scan_cache)
     write_json(sessions_dir / f"{session_id}.json", session)
     write_json(out_dir / "latest.json", session)
 

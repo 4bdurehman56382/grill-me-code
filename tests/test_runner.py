@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import unittest
 
@@ -33,6 +34,33 @@ class GrillRunnerTests(unittest.TestCase):
             files = grill_packet.scoped_files(root, ["src.py,../outside.py"])
             self.assertEqual(files, [inside.resolve()])
 
+    def test_non_git_repo_mode_falls_back_to_directory_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.py"
+            source.write_text("print('ok')\n", encoding="utf-8")
+            self.assertEqual(grill_packet.git_repo_files(root, 10), [source])
+
+    def test_staged_diff_files_are_distinct_from_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.check_call(["git", "init", "-b", "main"], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=root)
+            subprocess.check_call(["git", "config", "user.name", "Test"], cwd=root)
+            staged = root / "staged.py"
+            worktree = root / "worktree.py"
+            staged.write_text("print('base')\n", encoding="utf-8")
+            worktree.write_text("print('base')\n", encoding="utf-8")
+            subprocess.check_call(["git", "add", "staged.py", "worktree.py"], cwd=root)
+            subprocess.check_call(["git", "commit", "-m", "base"], cwd=root, stdout=subprocess.DEVNULL)
+            staged.write_text("print('staged')\n", encoding="utf-8")
+            subprocess.check_call(["git", "add", "staged.py"], cwd=root)
+            worktree.write_text("print('unstaged')\n", encoding="utf-8")
+            staged_only = [path.name for path in grill_packet.git_diff_files(root, None, "staged")]
+            all_diff = [path.name for path in grill_packet.git_diff_files(root, None, "all")]
+            self.assertEqual(staged_only, ["staged.py"])
+            self.assertEqual(sorted(all_diff), ["staged.py", "worktree.py"])
+
     def test_static_findings_ignore_keywords_inside_strings(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -55,6 +83,25 @@ class GrillRunnerTests(unittest.TestCase):
             source.write_text("open(request.args['path'])\n", encoding="utf-8")
             findings = grill_runner.static_findings(root, [source])
             self.assertEqual(findings[0]["code"], "SEC-005")
+
+    def test_static_findings_do_not_flag_cache_signature_compare(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "cache.py"
+            source.write_text('if cached.get("sha256") == digest and cached.get("signature") == signature:\n    pass\n', encoding="utf-8")
+            findings = grill_runner.static_findings(root, [source])
+            self.assertEqual(findings, [])
+
+    def test_large_file_limit_records_skipped_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            huge = root / "huge.js"
+            huge.write_text("x" * 128, encoding="utf-8")
+            config = grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {"scan": {"max_file_bytes": 10}}))
+            files, findings, skipped = grill_runner.filter_scan_files(root, [huge], config)
+            self.assertEqual(files, [])
+            self.assertEqual(skipped[0]["path"], "huge.js")
+            self.assertEqual(findings[0]["code"], "SCAN-SKIP")
 
     def test_python_ast_detects_os_system_and_ignores_comment_eval(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -97,6 +144,20 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual(metrics["trivial_assertions"], 1)
             self.assertEqual(metrics["files_without_assertions"], ["empty.test.js"])
 
+    def test_test_assertion_metrics_detects_common_js_frameworks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            test_file = root / "app.test.js"
+            test_file.write_text(
+                "t.is(actual, expected);\n"
+                "value.should.equal(1);\n"
+                "await expect(promise).rejects.toThrow();\n",
+                encoding="utf-8",
+            )
+            metrics = grill_runner.test_assertion_metrics(root, [test_file])
+            self.assertEqual(metrics["assertions"], 3)
+            self.assertEqual(metrics["trivial_assertions"], 0)
+
     def test_truthiness_assertion_with_value_is_not_trivial(self):
         self.assertTrue(grill_runner.is_trivial_assert_text("assert True"))
         self.assertFalse(grill_runner.is_trivial_assert_text("self.assertTrue(result.ok)"))
@@ -110,6 +171,40 @@ class GrillRunnerTests(unittest.TestCase):
             findings = grill_runner.static_findings(root, [source])
             self.assertEqual(findings[0]["code"], "SEC-012")
             self.assertEqual(findings[0]["source"], "compiled-semantic")
+
+    def test_compiled_semantic_detects_dart_process_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "main.dart"
+            source.write_text("void run(user) { Process.run(user, []); }\n", encoding="utf-8")
+            findings = grill_runner.static_findings(root, [source])
+            self.assertEqual(findings[0]["code"], "SEC-012")
+            self.assertEqual(findings[0]["source"], "compiled-semantic")
+
+    def test_cross_file_flow_detects_imported_sink_wrapper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sink = root / "exec.js"
+            app = root / "app.js"
+            sink.write_text("export function runCommand(cmd) { exec(cmd); }\n", encoding="utf-8")
+            app.write_text("import { runCommand } from './exec';\nrunCommand(req.query.cmd);\n", encoding="utf-8")
+            findings = grill_runner.static_findings(root, [sink, app])
+            self.assertTrue(any(finding["source"] == "cross-file-flow" for finding in findings))
+
+    def test_cached_static_findings_reuses_unchanged_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.py"
+            source.write_text("eval(user_input)\n", encoding="utf-8")
+            patterns = list(grill_runner.BUILTIN_STATIC_PATTERNS)
+            signature = grill_runner.scanner_signature(patterns)
+            cache = {"version": grill_runner.SCANNER_CACHE_VERSION, "files": {}}
+            first, cache, first_stats = grill_runner.cached_static_findings(root, [source], patterns, cache, True, signature)
+            second, cache, second_stats = grill_runner.cached_static_findings(root, [source], patterns, cache, True, signature)
+            self.assertEqual(first[0]["code"], "SEC-001")
+            self.assertEqual(second[0]["code"], "SEC-001")
+            self.assertEqual(first_stats["misses"], 1)
+            self.assertEqual(second_stats["hits"], 1)
 
     def test_rule_priority_combines_same_line_highest_severity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,6 +303,7 @@ class GrillRunnerTests(unittest.TestCase):
             "mode": "scope",
             "depth": "standard",
             "files": ["app.py"],
+            "skipped_files": [],
             "config_path": ".grill-me-code.yaml",
             "baseline": {"path": ".grill-me-code/baseline.json"},
             "findings": [],
@@ -215,14 +311,16 @@ class GrillRunnerTests(unittest.TestCase):
             "checks": {"results": [], "discovered": [], "run_project_checks": False},
             "test_assertions": {"test_files": 1, "assertions": 1, "trivial_assertions": 0},
             "reasoning": [{"name": "reason", "ok": True, "output": "looks good"}],
+            "cache": {"enabled": True, "path": ".grill-me-code/cache.json", "hits": 1, "misses": 0},
             "gsd": {"detected": False},
-            "score": {"verdict": "SHIP", "risk_score": 0, "proof_score": 80, "ship_score": 100},
+            "score": {"verdict": "SHIP", "risk_score": 0, "risk_band": "none", "proof_score": 80, "proof_band": "strong", "ship_score": 100, "verdict_reasons": ["clean"]},
         }
         report = grill_runner.markdown_report(session)
         self.assertIn("Suppressed findings: 1", report)
         self.assertIn("## Suppressed Findings", report)
         self.assertIn("## Test Proof", report)
         self.assertIn("## Reasoning Plugins", report)
+        self.assertIn("## Cache", report)
 
     def test_discover_project_checks_reads_package_scripts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -247,6 +345,24 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual(health[0]["severity"], "question")
             self.assertIn("missing-tool", health[0]["title"])
 
+    def test_discover_project_checks_mobile_toolchains_and_npx_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Package.swift").write_text("// swift package\n", encoding="utf-8")
+            (root / "pubspec.yaml").write_text("name: app\n", encoding="utf-8")
+            (root / "build.gradle.kts").write_text("plugins {}\n", encoding="utf-8")
+            config = grill_runner.normalize_config(grill_runner.merge_dicts(grill_runner.DEFAULT_CONFIG, {
+                "check_plugins": [{"name": "eslint-npx", "command": ["npx", "eslint", "."], "kind": "static-analysis"}],
+            }))
+            checks = grill_runner.discover_project_checks(root, config)
+            names = [item["name"] for item in checks]
+            self.assertIn("swift:test", names)
+            self.assertTrue("dart:test" in names or "flutter:test" in names)
+            self.assertIn("gradle:test", names)
+            npx_check = next(item for item in checks if item["name"] == "eslint-npx")
+            if shutil.which("npx"):
+                self.assertIn("eslint", npx_check.get("missing_reason", ""))
+
     def test_analysis_plugin_findings_are_loaded(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -261,6 +377,22 @@ class GrillRunnerTests(unittest.TestCase):
             findings, results = grill_runner.run_analysis_plugins(root, plugins, {"files": []}, timeout=5)
             self.assertTrue(results[0]["ok"])
             self.assertEqual(findings[0]["id"], "PLUGIN-001")
+
+    def test_analysis_plugin_jsonl_and_schema_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin = root / "plugin.py"
+            plugin.write_text(
+                "print('{\"progress\":\"half\"}')\n"
+                "print('{\"finding\":{\"id\":\"PLUGIN-001\",\"severity\":\"wild\",\"title\":\"bad severity\",\"file\":\"../outside.py\"}}')\n",
+                encoding="utf-8",
+            )
+            plugins = [{"name": "plugin", "command": [sys.executable, str(plugin)], "kind": "analysis"}]
+            findings, results = grill_runner.run_analysis_plugins(root, plugins, {"files": []}, timeout=5)
+            self.assertEqual(results[0]["events"], 1)
+            self.assertTrue(any(finding["code"] == "ANALYSIS-SCHEMA" for finding in findings))
+            self.assertTrue(any(finding["code"] == "ANALYSIS-SCHEMA-PATH" for finding in findings))
+            self.assertTrue(any(finding["id"] == "PLUGIN-001" and finding["severity"] == "question" for finding in findings))
 
     def test_reasoning_plugin_output_is_captured(self):
         with tempfile.TemporaryDirectory() as tmp:

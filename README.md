@@ -15,16 +15,18 @@ It is designed to be forkable: runner scripts with minimal dependencies, stable 
 
 ## Signature Features
 
-- **CODE-GRILL-PACKET:** dependency-free packet generator for repo, diff, release, fix, or explicit file scopes.
+- **CODE-GRILL-PACKET:** dependency-free packet generator for repo, diff, release, fix, or explicit file scopes, with repo-mode fallback outside git.
 - **Runner engine:** scope resolution -> packet -> static findings -> project checks -> scoring -> persisted report.
 - **Config file:** `.grill-me-code.yaml`, `.grill-me-code.yml`, or `.grill-me-code.json` can tune thresholds, severity overrides, suppressions, and custom static patterns.
 - **Baselines and learnings:** known accepted findings can be suppressed by stable fingerprints instead of reappearing forever.
-- **Diff-aware scoring:** diff mode separates introduced findings from legacy findings in changed files.
-- **Semantic checks:** Python AST checks plus JS/TS alias heuristics catch some risks that plain regex misses.
-- **Test proof checks:** scoped tests are checked for detectable non-trivial assertions.
+- **Diff-aware scoring:** diff mode separates introduced findings from legacy findings and can target worktree, staged, or combined diffs.
+- **Semantic checks:** Python AST checks, JS/TS alias heuristics, command-use heuristics for Go/Rust/Kotlin/Swift/Dart, and lightweight JS/TS cross-file source-to-sink signals catch some risks that plain regex misses.
+- **Test proof checks:** scoped tests are checked for detectable non-trivial assertions across common Python, JS, Java, Kotlin, Swift, Dart, Go, and Rust assertion styles.
+- **Scan limits and cache:** oversized files are reported instead of fully loaded, and unchanged files can reuse cached static findings.
 - **Runner Jury Mode:** Breaker, Security, Tester, Refactorer, Release Captain, and Maintainer each get a per-lens score.
-- **Plugin hooks:** teams can register check, analysis, and reasoning commands without editing the runner.
+- **Plugin hooks:** teams can register check, analysis, and reasoning commands without editing the runner; analysis plugins may stream JSONL progress/findings.
 - **GitHub annotations:** CI can emit file/line annotations from `latest.json`.
+- **Verdict bands:** reports include risk/proof bands and verdict reasons so `SHIP WITH RISKS` is not a mystery bucket.
 - **Fix Receipts:** every fix should include files changed, verification command, result, and remaining risk.
 - **Ship Verdict:** `SHIP`, `SHIP WITH RISKS`, `DO NOT SHIP`, or `BLOCKED`.
 - **Pre-code grilling:** interrogates plans before code exists, not just PRs after the damage is done.
@@ -88,9 +90,12 @@ Run the engine:
 
 ```bash
 python3 scripts/grill_runner.py --mode diff --depth standard
+python3 scripts/grill_runner.py --mode diff --diff-filter staged
+python3 scripts/grill_runner.py --mode diff --diff-filter all
 python3 scripts/grill_runner.py --mode repo --depth deep --max-files 40 --run-checks
 python3 scripts/grill_runner.py --scope SKILL.md,scripts/grill_runner.py --plan README.md --run-checks
 python3 scripts/grill_runner.py --mode repo --run-checks --progress --jobs 8
+python3 scripts/grill_runner.py --mode repo --no-cache
 python3 scripts/grill_runner.py --mode diff --reasoning-command "llm prompt --system 'Review this CODE-GRILL session JSON.'"
 python3 scripts/grill_runner.py --diff-sessions .grill-me-code/sessions/old.json .grill-me-code/latest.json
 ```
@@ -118,6 +123,9 @@ Copy `.grill-me-code.example.yaml` to `.grill-me-code.yaml` when a repo needs lo
 thresholds:
   ship_with_risks_risk: 40
   min_proof_ship: 65
+scan:
+  max_file_bytes: 2000000
+  cache: true
 severity_overrides:
   BUG-002: nit
 ignore:
@@ -142,7 +150,9 @@ reasoning_plugins:
     kind: reasoning
 ```
 
-Analysis plugins receive a JSON payload on stdin and should return a JSON list of findings or `{ "findings": [...] }`. Reasoning plugins receive the session JSON on stdin and their output is attached to the report. The runner does not claim LLM-backed reasoning unless one of those commands actually runs.
+Analysis plugins receive a JSON payload on stdin and should return a JSON list, `{ "findings": [...] }`, or JSONL lines containing `progress` events and `finding` objects. Plugin findings are schema-normalized before scoring. Reasoning plugins receive the session JSON on stdin and their output is attached to the report. The runner does not claim LLM-backed reasoning unless one of those commands actually runs.
+
+The built-in analyzer is intentionally lightweight. It includes limited cross-file JS/TS flow signals, but it is not a full call graph, taint engine, or replacement for Semgrep, CodeQL, Bandit, ESLint, type checkers, or project-specific analysis plugins.
 
 The score is a transparent heuristic, not a calibrated probability. `scripts/calibrate_scores.py` runs the verdict corpus in `calibration/cases.json` so threshold changes have visible expected outcomes.
 

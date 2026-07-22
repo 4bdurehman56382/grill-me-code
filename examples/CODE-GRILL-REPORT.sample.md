@@ -13,20 +13,44 @@ ship_score: 28
 ## Verdict
 
 Decision: **DO NOT SHIP**
-Risk score: **62/100**
+Risk score: **62/100** (high)
 Introduced risk: **42/100**
 Legacy risk: **20/100**
 Legacy risk level: **low**
 Total risk: **62/100**
-Proof score: **40/100**
+Proof score: **40/100** (weak)
 Ship score: **28/100**
+
+### Verdict Reasons
+
+- 1 introduced/scope blocker finding(s)
+- 1 failed check(s)
+
+## Scope
+
+Files reviewed: 2
+- `src/config.ts`
+- `src/config.test.ts`
+
+## Scan Limits
+
+Skipped files: 1
+- `fixtures/large-snapshot.json` (6500000 bytes > 2000000)
 
 ## Diff Awareness
 
 Diff-aware scoring: `true`
+Diff filter: `worktree`
 Changed-line files: 2
 Introduced findings: 2
 Legacy findings: 1
+
+## Cache
+
+Enabled: `true`
+Path: `.grill-me-code/cache.json`
+Hits: 4
+Misses: 2
 
 ## Configuration
 

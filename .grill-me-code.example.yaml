@@ -15,6 +15,11 @@ test_proof:
   # off: disable the no-test finding
   mode: code
 
+scan:
+  # 0 disables the size guard. Large skipped files are reported as review gaps.
+  max_file_bytes: 2000000
+  cache: true
+
 severity_overrides:
   # BUG-002: nit
   # OPS-002: question
