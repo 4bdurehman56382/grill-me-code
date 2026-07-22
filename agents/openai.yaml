@@ -1,6 +1,6 @@
 interface:
   display_name: "Grill Me Code"
-  short_description: "Diff-aware code grilling with cache, checks, plugins, and policy memory."
-  default_prompt: "Use $grill-me-code to run scripts/grill_runner.py, generate CODE-GRILL-PACKET and CODE-GRILL-REPORT, apply config/baselines/learnings when present, compare introduced vs legacy risk, choose the right diff filter, use semantic and cross-file flow findings, scan-limit/cache evidence, test assertion proof, configured plugins, jury scores, verification checks, and give a ship verdict with reasons."
+  short_description: "Diff-aware code grilling with taint heuristics, checks, plugins, and policy memory."
+  default_prompt: "Use $grill-me-code to run scripts/grill_runner.py, generate CODE-GRILL-PACKET and CODE-GRILL-REPORT, initialize config when needed, apply config/baselines/learnings when present, compare introduced vs legacy risk, choose the right diff filter, use AST/taint/semantic/cross-file flow findings, scan-limit/cache evidence, test assertion proof, optional security checks, structured plugins, jury scores, verification checks, session deltas, and give a ship verdict with reasons."
 policy:
   allow_implicit_invocation: true

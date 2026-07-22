@@ -113,6 +113,20 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual(findings[0]["code"], "SEC-012")
             self.assertEqual(findings[0]["source"], "python-ast")
 
+    def test_python_taint_detects_indirect_path_sink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.py"
+            source.write_text(
+                "def view(request):\n"
+                "    target = request.args['file']\n"
+                "    return open(target).read()\n",
+                encoding="utf-8",
+            )
+            findings = grill_runner.static_findings(root, [source])
+            self.assertEqual(findings[0]["code"], "SEC-005")
+            self.assertEqual(findings[0]["source"], "python-taint")
+
     def test_js_semantic_detects_eval_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -130,6 +144,20 @@ class GrillRunnerTests(unittest.TestCase):
             findings = grill_runner.static_findings(root, [source])
             self.assertEqual(findings[0]["code"], "SEC-012")
             self.assertEqual(findings[0]["source"], "js-semantic")
+
+    def test_js_taint_detects_indirect_filesystem_sink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.js"
+            source.write_text(
+                "const fs = require('fs');\n"
+                "const target = req.query.file;\n"
+                "fs.readFileSync(target);\n",
+                encoding="utf-8",
+            )
+            findings = grill_runner.static_findings(root, [source])
+            self.assertEqual(findings[0]["code"], "SEC-005")
+            self.assertEqual(findings[0]["source"], "js-taint")
 
     def test_test_assertion_metrics_flags_empty_and_trivial_tests(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,6 +206,15 @@ class GrillRunnerTests(unittest.TestCase):
             source = root / "main.dart"
             source.write_text("void run(user) { Process.run(user, []); }\n", encoding="utf-8")
             findings = grill_runner.static_findings(root, [source])
+            self.assertEqual(findings[0]["code"], "SEC-012")
+            self.assertEqual(findings[0]["source"], "compiled-semantic")
+
+    def test_compiled_semantic_detects_java_runtime_exec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "App.java"
+            source.write_text('class App { void run(String user) { Runtime.getRuntime().exec(user); } }\n', encoding="utf-8")
+            findings = grill_runner.compiled_language_semantic_findings(root, [source])
             self.assertEqual(findings[0]["code"], "SEC-012")
             self.assertEqual(findings[0]["source"], "compiled-semantic")
 
@@ -330,6 +367,14 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertIn("npm:lint", names)
             self.assertIn("npm:test", names)
 
+    def test_discover_project_checks_adds_npm_audit_for_lockfile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package-lock.json").write_text("{}", encoding="utf-8")
+            checks = grill_runner.discover_project_checks(root)
+            npm_audit = next(item for item in checks if item["name"] == "npm:audit")
+            self.assertEqual(npm_audit["kind"], "security")
+
     def test_discover_project_checks_makefile_and_plugin_missing_health(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -404,6 +449,23 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual(findings, [])
             self.assertEqual(outputs[0]["output"].strip(), "reasoned")
 
+    def test_reasoning_plugin_structured_output_adds_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin = root / "reason.py"
+            plugin.write_text(
+                "import sys, json\n"
+                "json.load(sys.stdin)\n"
+                "print(json.dumps({'summary':'reviewed','verdict':'SHIP WITH RISKS','questions':['what proof is missing?'],'findings':[{'severity':'warning','title':'reasoned risk','file':'app.py','line':2}]}))\n",
+                encoding="utf-8",
+            )
+            plugins = [{"name": "reason", "command": [sys.executable, str(plugin)], "kind": "reasoning"}]
+            outputs, findings = grill_runner.run_reasoning_plugins(root, plugins, {"score": {}}, timeout=5)
+            self.assertEqual(outputs[0]["structured"]["verdict"], "SHIP WITH RISKS")
+            self.assertEqual(findings[0]["source"], "reasoning-plugin:reason")
+            self.assertEqual(findings[0]["severity"], "warning")
+            self.assertEqual(findings[0]["code"], "REASONING")
+
     def test_run_project_checks_records_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -444,6 +506,26 @@ class GrillRunnerTests(unittest.TestCase):
             code = grill_runner.main(["--mode", "scope"])
         self.assertEqual(code, 2)
         self.assertIn("requires at least one --scope", stderr.getvalue())
+
+    def test_runner_init_writes_config_and_refuses_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    first = grill_runner.main(["--init"])
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    second = grill_runner.main(["--init"])
+            finally:
+                os.chdir(old_cwd)
+            config_text = (root / ".grill-me-code.yaml").read_text(encoding="utf-8")
+            self.assertEqual(first, 0)
+            self.assertEqual(second, 2)
+            self.assertIn("detected_languages: Python", config_text)
+            self.assertIn("force-init", stderr.getvalue())
 
     def test_runner_fail_on_do_not_ship_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -538,6 +620,25 @@ class GrillRunnerTests(unittest.TestCase):
         self.assertEqual(len(diff["added"]), 1)
         self.assertEqual(len(diff["resolved"]), 1)
         self.assertIn("CODE-GRILL-SESSION-DIFF", grill_runner.markdown_session_diff(diff))
+
+    def test_runner_since_session_attaches_delta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            previous = root / "old.json"
+            previous.write_text(json.dumps({"session_id": "old", "score": {"verdict": "DO NOT SHIP"}, "findings": [{"id": "OLD-001", "fingerprint": "old-risk", "title": "old"}]}), encoding="utf-8")
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = grill_runner.main(["--scope", "app.py", "--output-dir", ".out", "--since-session", "old.json"])
+            finally:
+                os.chdir(old_cwd)
+            session = json.loads((root / ".out" / "latest.json").read_text(encoding="utf-8"))
+            report = (root / ".out" / "CODE-GRILL-REPORT.md").read_text(encoding="utf-8")
+            self.assertEqual(code, 0)
+            self.assertEqual(session["session_delta"]["old_session_id"], "old")
+            self.assertIn("## Session Delta", report)
 
     def test_plan_mentions_file_requires_bounded_filename_match(self):
         self.assertFalse(grill_runner.plan_mentions_file("we need to test this", "src/test.py", "test.py"))

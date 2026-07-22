@@ -51,3 +51,6 @@ reasoning_plugins:
   - name: llm-reviewer
     command: ["llm", "prompt", "--system", "Review this CODE-GRILL session JSON."]
     kind: reasoning
+    # Plain text is attached to the report. Structured JSON may include:
+    # summary, verdict, confidence, risks, questions, recommendations,
+    # remaining_risks, and findings.

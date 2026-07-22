@@ -90,11 +90,35 @@ Evidence: n/a
   - kind: `test`
   - timed out: `False`
 
+## Session Delta
+
+Old session: `previous`
+New session: `sample`
+Old verdict: **SHIP WITH RISKS**
+New verdict: **DO NOT SHIP**
+Added findings: 1
+Resolved findings: 0
+Persisting findings: 2
+
+### Added
+
+- `SEC-001-001` blocker Possible hardcoded secret at `src/config.ts:12`
+
 ## Reasoning Plugins
 
 ### llm-reviewer
 
 Status: **PASS**
+Structured verdict: **DO NOT SHIP**
+Confidence: `0.78`
+
+#### Summary
+
+The blocker is real unless the token source is replaced with environment-backed configuration.
+
+#### Questions
+
+- Which assertion proves the config source is no longer hardcoded?
 
 ```text
 The blocker is real unless the token source is replaced with environment-backed configuration.

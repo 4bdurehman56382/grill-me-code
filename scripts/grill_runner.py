@@ -119,7 +119,7 @@ TEST_PATTERNS = [
 
 VALID_SEVERITIES = {"blocked", "blocker", "warning", "question", "nit"}
 SUPPRESSING_OUTCOMES = {"false_positive", "accepted_risk"}
-SCANNER_CACHE_VERSION = 2
+SCANNER_CACHE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -617,7 +617,9 @@ def annotate_diff_status(findings: list[dict[str, Any]], changed_lines: dict[str
 
 def finding_code(finding: dict[str, Any]) -> str:
     identifier = str(finding.get("id", ""))
-    return re.sub(r"(?:-(?:AST|JS|COMPILED))?-\d{3}$", "", identifier)
+    if re.fullmatch(r"(?:PLUGIN|REASONING)-\d{3}-\d{3}", identifier):
+        return identifier.split("-", 1)[0]
+    return re.sub(r"(?:-(?:AST|JS|JS-TAINT|TAINT|COMPILED|FLOW|REASONING))?-\d{3}$", "", identifier)
 
 
 def finding_fingerprint(finding: dict[str, Any]) -> str:
@@ -849,6 +851,122 @@ def python_ast_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
     return annotate_findings(findings)
 
 
+PYTHON_SOURCE_NAMES = {"input", "request", "req", "params", "query", "body", "args", "form", "cookies", "headers", "argv", "stdin", "environ"}
+PYTHON_SANITIZER_HINTS = ("sanitize", "validate", "escape", "quote", "normpath", "resolve", "basename", "realpath", "abspath")
+
+
+def python_name_mentions_source(name: str) -> bool:
+    lowered = name.lower()
+    return any(part in PYTHON_SOURCE_NAMES for part in lowered.replace("[", ".").replace("]", ".").split("."))
+
+
+def python_expr_is_sanitized(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    name = ast_call_name(node.func).lower()
+    return any(hint in name for hint in PYTHON_SANITIZER_HINTS)
+
+
+def python_expr_is_tainted(node: ast.AST, tainted: set[str]) -> bool:
+    if python_expr_is_sanitized(node):
+        return False
+    if isinstance(node, ast.Name):
+        return node.id in tainted or python_name_mentions_source(node.id)
+    if isinstance(node, ast.Attribute):
+        return ast_call_name(node).split(".")[0] in tainted or python_name_mentions_source(ast_call_name(node))
+    if isinstance(node, ast.Subscript):
+        return python_expr_is_tainted(node.value, tainted)
+    if isinstance(node, ast.Call):
+        name = ast_call_name(node.func)
+        if name == "input" or python_name_mentions_source(name):
+            return True
+        return any(python_expr_is_tainted(arg, tainted) for arg in node.args) or any(python_expr_is_tainted(keyword.value, tainted) for keyword in node.keywords)
+    if isinstance(node, (ast.JoinedStr, ast.BinOp, ast.BoolOp, ast.Compare, ast.Tuple, ast.List, ast.Set)):
+        return any(python_expr_is_tainted(child, tainted) for child in ast.iter_child_nodes(node))
+    return False
+
+
+def python_assignment_targets(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        output = []
+        for item in node.elts:
+            output.extend(python_assignment_targets(item))
+        return output
+    return []
+
+
+def python_taint_sink(node: ast.Call, tainted: set[str]) -> tuple[str, str] | None:
+    name = ast_call_name(node.func)
+    has_tainted_arg = any(python_expr_is_tainted(arg, tainted) for arg in node.args)
+    shell_true = any(keyword.arg == "shell" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in node.keywords)
+    if name in {"eval", "exec"} and has_tainted_arg:
+        return "SEC-001", "Tainted input reaches dynamic code execution."
+    if name == "os.system" and has_tainted_arg:
+        return "SEC-012", "Tainted input reaches command execution."
+    if name.startswith("subprocess.") and has_tainted_arg and shell_true:
+        return "SEC-003", "Tainted input reaches subprocess with shell=True."
+    if name in {"open", "pathlib.Path"} and has_tainted_arg:
+        return "SEC-005", "Tainted input reaches file path handling."
+    return None
+
+
+def python_taint_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    findings = []
+    for path in files:
+        if path.suffix != ".py":
+            continue
+        rel = str(path.relative_to(root))
+        try:
+            source = path.read_text(encoding="utf-8", errors="ignore")
+            tree = ast.parse(source, filename=rel)
+            lines = source.splitlines()
+        except (OSError, SyntaxError):
+            continue
+
+        scopes = [tree, *[node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]]
+        for scope in scopes:
+            tainted: set[str] = set()
+            body = getattr(scope, "body", [])
+            for statement in body:
+                for node in ast.walk(statement):
+                    if isinstance(node, ast.Call):
+                        sink = python_taint_sink(node, tainted)
+                        if not sink:
+                            continue
+                        code, title = sink
+                        line_number = getattr(node, "lineno", 0) or 0
+                        evidence = lines[line_number - 1].strip()[:240] if 0 < line_number <= len(lines) else ""
+                        findings.append({
+                            "id": f"{code}-TAINT-{len(findings) + 1:03d}",
+                            "severity": "blocker" if code in {"SEC-001", "SEC-003", "SEC-012"} else "warning",
+                            "file": rel,
+                            "line": line_number,
+                            "title": title,
+                            "evidence": evidence,
+                            "source": "python-taint",
+                        })
+                if isinstance(statement, ast.Assign):
+                    value_tainted = python_expr_is_tainted(statement.value, tainted)
+                    for target in statement.targets:
+                        for name in python_assignment_targets(target):
+                            if value_tainted:
+                                tainted.add(name)
+                            else:
+                                tainted.discard(name)
+                elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+                    if statement.value and python_expr_is_tainted(statement.value, tainted):
+                        tainted.add(statement.target.id)
+                    else:
+                        tainted.discard(statement.target.id)
+                elif isinstance(statement, ast.AugAssign):
+                    for name in python_assignment_targets(statement.target):
+                        if python_expr_is_tainted(statement.value, tainted):
+                            tainted.add(name)
+    return annotate_findings(findings)
+
+
 def javascript_semantic_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
     findings = []
     ordinal = 1
@@ -934,11 +1052,137 @@ def javascript_semantic_findings(root: Path, files: list[Path]) -> list[dict[str
     return annotate_findings(findings)
 
 
+JS_TAINT_EXTENSIONS = {".js", ".jsx", ".mjs", ".ts", ".tsx", ".vue", ".svelte"}
+JS_SANITIZER_RE = re.compile(r"\b(?:sanitize|validate|escape|encodeURIComponent|path\.(?:normalize|resolve)|(?:allow|white)list)\s*\(", re.I)
+JS_ASSIGNMENT_RE = re.compile(r"\b(?:const|let|var)?\s*([A-Za-z_$][\w$]*)\s*=\s*(.+?);?\s*$")
+JS_FS_METHODS = "readFile|readFileSync|writeFile|writeFileSync|createReadStream|createWriteStream|unlink|unlinkSync|rm|rmSync"
+JS_FS_METHOD_NAMES = set(JS_FS_METHODS.split("|"))
+
+
+def js_expression_is_tainted(expression: str, tainted: set[str]) -> bool:
+    if JS_SANITIZER_RE.search(expression):
+        return False
+    if SOURCE_LIKE_RE.search(expression):
+        return True
+    return any(re.search(rf"\b{re.escape(name)}\b", expression) for name in tainted)
+
+
+def js_call_has_tainted_arg(surface: str, name_pattern: str, tainted: set[str]) -> bool:
+    match = re.search(rf"\b(?:{name_pattern})\s*\((.*)\)", surface)
+    if not match:
+        return False
+    return js_expression_is_tainted(match.group(1), tainted)
+
+
+def js_taint_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    findings = []
+    for path in files:
+        if path.suffix not in JS_TAINT_EXTENSIONS:
+            continue
+        rel = str(path.relative_to(root))
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+
+        tainted: set[str] = set()
+        eval_aliases: set[str] = set()
+        child_process_aliases: set[str] = set()
+        child_process_exec_aliases: set[str] = set()
+        fs_aliases: set[str] = set()
+        fs_method_aliases: set[str] = set()
+
+        for line_number, line in enumerate(lines, start=1):
+            surface = comment_stripped_surface(path, line)
+            if not surface:
+                continue
+            code_surface = STRING_LITERAL_RE.sub('""', surface)
+
+            for match in re.finditer(r"\b(?:const|let|var)?\s*([A-Za-z_$][\w$]*)\s*=\s*eval\b", code_surface):
+                eval_aliases.add(match.group(1))
+
+            cp_alias = re.search(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['\"]child_process['\"]\s*\)", surface)
+            if cp_alias:
+                child_process_aliases.add(cp_alias.group(1))
+
+            fs_alias = re.search(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['\"]fs['\"]\s*\)", surface)
+            if fs_alias:
+                fs_aliases.add(fs_alias.group(1))
+
+            destructured = re.search(r"\{\s*([^}]+)\s*\}\s*=\s*require\(\s*['\"](child_process|fs)['\"]\s*\)", surface)
+            if destructured:
+                module_name = destructured.group(2)
+                for part in destructured.group(1).split(","):
+                    name = part.strip()
+                    if not name:
+                        continue
+                    imported, local = [piece.strip() for piece in name.split(":", 1)] if ":" in name else (name, name)
+                    if module_name == "child_process" and imported in {"exec", "execSync", "spawn", "spawnSync"}:
+                        child_process_exec_aliases.add(local)
+                    if module_name == "fs" and imported in JS_FS_METHOD_NAMES:
+                        fs_method_aliases.add(local)
+
+            import_match = re.search(r"import\s+\{\s*([^}]+)\s*\}\s+from\s+['\"](child_process|fs)['\"]", surface)
+            if import_match:
+                module_name = import_match.group(2)
+                for part in import_match.group(1).split(","):
+                    name = part.strip()
+                    if not name:
+                        continue
+                    imported, local = [piece.strip() for piece in name.split(" as ", 1)] if " as " in name else (name, name)
+                    if module_name == "child_process" and imported in {"exec", "execSync", "spawn", "spawnSync"}:
+                        child_process_exec_aliases.add(local)
+                    if module_name == "fs" and imported in JS_FS_METHOD_NAMES:
+                        fs_method_aliases.add(local)
+
+            sink: tuple[str, str] | None = None
+            eval_names = sorted({"eval", *eval_aliases})
+            command_patterns = [
+                r"child_process\.(?:exec|execSync|spawn|spawnSync)",
+                *[rf"{re.escape(alias)}\.(?:exec|execSync|spawn|spawnSync)" for alias in sorted(child_process_aliases)],
+                *[re.escape(alias) for alias in sorted(child_process_exec_aliases)],
+            ]
+            fs_patterns = [
+                rf"(?:{'|'.join(['fs', *[re.escape(alias) for alias in sorted(fs_aliases)]])})\.(?:{JS_FS_METHODS})",
+                *[re.escape(alias) for alias in sorted(fs_method_aliases)],
+                r"path\.(?:join|resolve|normalize)",
+            ]
+
+            if js_call_has_tainted_arg(code_surface, "|".join(re.escape(name) for name in eval_names), tainted):
+                sink = ("SEC-001", "Tainted input reaches dynamic JavaScript execution.")
+            elif command_patterns and js_call_has_tainted_arg(code_surface, "|".join(command_patterns), tainted):
+                sink = ("SEC-012", "Tainted input reaches Node command execution.")
+            elif fs_patterns and js_call_has_tainted_arg(code_surface, "|".join(fs_patterns), tainted):
+                sink = ("SEC-005", "Tainted input reaches filesystem path handling.")
+
+            if sink:
+                code, title = sink
+                findings.append({
+                    "id": f"{code}-JS-TAINT-{len(findings) + 1:03d}",
+                    "severity": "blocker" if code in {"SEC-001", "SEC-012"} else "warning",
+                    "file": rel,
+                    "line": line_number,
+                    "title": title,
+                    "evidence": line.strip()[:240],
+                    "source": "js-taint",
+                })
+
+            assignment = JS_ASSIGNMENT_RE.search(code_surface)
+            if assignment:
+                name = assignment.group(1)
+                expression = assignment.group(2)
+                if js_expression_is_tainted(expression, tainted):
+                    tainted.add(name)
+                else:
+                    tainted.discard(name)
+    return annotate_findings(findings)
+
+
 def compiled_language_semantic_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
     findings = []
     ordinal = 1
     for path in files:
-        if path.suffix not in {".go", ".rs", ".kt", ".kts", ".swift", ".dart"}:
+        if path.suffix not in {".go", ".rs", ".kt", ".kts", ".swift", ".dart", ".java", ".cs", ".php"}:
             continue
         rel = str(path.relative_to(root))
         try:
@@ -959,6 +1203,12 @@ def compiled_language_semantic_findings(root: Path, files: list[Path]) -> list[d
                 title = "Swift Process usage needs argument containment proof."
             elif path.suffix == ".dart" and re.search(r"\bProcess\.(?:run|start|runSync|startDetached)\s*\(", surface):
                 title = "Dart process execution needs argument containment proof."
+            elif path.suffix == ".java" and re.search(r"\b(?:Runtime\.getRuntime\(\)\.exec|new\s+ProcessBuilder)\s*\(", surface):
+                title = "Java process execution needs argument containment proof."
+            elif path.suffix == ".cs" and re.search(r"\b(?:Process\.Start|new\s+ProcessStartInfo)\s*\(", surface):
+                title = "C# process execution needs argument containment proof."
+            elif path.suffix == ".php" and re.search(r"\b(?:shell_exec|system|passthru|proc_open|popen|exec)\s*\(", surface):
+                title = "PHP shell/process execution needs argument containment proof."
             else:
                 continue
             findings.append({
@@ -1158,7 +1408,9 @@ def regex_static_findings(root: Path, files: list[Path], patterns: list[StaticPa
 def raw_static_findings(root: Path, files: list[Path], patterns: list[StaticPattern] | None = None) -> list[dict[str, Any]]:
     findings = regex_static_findings(root, files, patterns)
     findings.extend(python_ast_findings(root, files))
+    findings.extend(python_taint_findings(root, files))
     findings.extend(javascript_semantic_findings(root, files))
+    findings.extend(js_taint_findings(root, files))
     findings.extend(compiled_language_semantic_findings(root, files))
     return annotate_findings(findings)
 
@@ -1170,6 +1422,10 @@ def scan_id_prefix(finding: dict[str, Any]) -> str:
         return f"{code}-AST"
     if source == "js-semantic":
         return f"{code}-JS"
+    if source == "js-taint":
+        return f"{code}-JS-TAINT"
+    if source == "python-taint":
+        return f"{code}-TAINT"
     if source == "compiled-semantic":
         return f"{code}-COMPILED"
     if source == "cross-file-flow":
@@ -1521,6 +1777,19 @@ def normalize_plugin_finding(root: Path, item: dict[str, Any], plugin: dict[str,
     return finding, warnings
 
 
+def normalize_reasoning_finding(root: Path, item: dict[str, Any], plugin: dict[str, Any], plugin_index: int, finding_index: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    finding, warnings = normalize_plugin_finding(root, item, plugin, plugin_index, finding_index)
+    finding.setdefault("id", f"REASONING-{plugin_index:03d}-{finding_index:03d}")
+    if str(finding.get("id", "")).startswith("PLUGIN-"):
+        finding["id"] = f"REASONING-{plugin_index:03d}-{finding_index:03d}"
+    finding["source"] = f"reasoning-plugin:{plugin['name']}"
+    for warning in warnings:
+        warning["source"] = "reasoning-plugin"
+        warning["title"] = warning.get("title", "").replace("Analysis plugin", "Reasoning plugin")
+        warning["id"] = warning.get("id", "").replace("ANALYSIS", "REASONING")
+    return finding, warnings
+
+
 def run_analysis_plugins(root: Path, plugins: list[dict[str, Any]], payload: dict[str, Any], timeout: int, progress: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     findings = []
     plugin_results = []
@@ -1586,6 +1855,43 @@ def run_analysis_plugins(root: Path, plugins: list[dict[str, Any]], payload: dic
     return annotate_findings(findings), plugin_results
 
 
+def parse_reasoning_output(output: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    text = output.strip()
+    if not text:
+        return {"output": ""}, [], ""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {"output": text[-8000:]}, [], ""
+
+    if isinstance(parsed, list):
+        return {"output": text[-8000:]}, [item for item in parsed if isinstance(item, dict)], ""
+    if not isinstance(parsed, dict):
+        return {"output": text[-8000:]}, [], "reasoning output JSON root must be an object or list"
+
+    output_item: dict[str, Any] = {}
+    structured = {}
+    for key in ["verdict", "summary", "risks", "questions", "recommendations", "confidence", "remaining_risks"]:
+        if key in parsed:
+            structured[key] = parsed[key]
+    if structured:
+        output_item["structured"] = structured
+
+    if "output" in parsed:
+        output_item["output"] = str(parsed.get("output", ""))[-8000:]
+    elif "summary" in parsed:
+        output_item["output"] = str(parsed.get("summary", ""))[-8000:]
+    else:
+        output_item["output"] = text[-8000:]
+
+    plugin_findings = parsed.get("findings", [])
+    if isinstance(plugin_findings, dict):
+        plugin_findings = [plugin_findings]
+    if not isinstance(plugin_findings, list):
+        return output_item, [], "reasoning findings must be a list"
+    return output_item, [item for item in plugin_findings if isinstance(item, dict)], ""
+
+
 def run_reasoning_plugins(root: Path, plugins: list[dict[str, Any]], session: dict[str, Any], timeout: int, progress: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     outputs = []
     findings = []
@@ -1619,13 +1925,14 @@ def run_reasoning_plugins(root: Path, plugins: list[dict[str, Any]], session: di
             })
             outputs.append({"name": plugin["name"], "ok": False, "timed_out": True})
             continue
-        outputs.append({
+        output_item = {
             "name": plugin["name"],
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
             "output": proc.stdout[-8000:],
-        })
+        }
         if proc.returncode != 0:
+            outputs.append(output_item)
             findings.append({
                 "id": f"REASONING-FAILED-{index:03d}",
                 "severity": "question",
@@ -1633,6 +1940,23 @@ def run_reasoning_plugins(root: Path, plugins: list[dict[str, Any]], session: di
                 "source": "reasoning-plugin",
                 "evidence": proc.stdout[-240:],
             })
+            continue
+        parsed_output, plugin_findings, parse_error = parse_reasoning_output(proc.stdout or "")
+        output_item.update(parsed_output)
+        outputs.append(output_item)
+        if parse_error:
+            findings.append({
+                "id": f"REASONING-BADJSON-{index:03d}",
+                "severity": "question",
+                "title": f"Reasoning plugin returned malformed structured output: {plugin['name']}",
+                "source": "reasoning-plugin",
+                "evidence": parse_error,
+            })
+            continue
+        for finding_index, item in enumerate(plugin_findings, start=1):
+            normalized, schema_warnings = normalize_reasoning_finding(root, item, plugin, index, finding_index)
+            findings.extend(schema_warnings)
+            findings.append(normalized)
     return outputs, annotate_findings(findings)
 
 
@@ -1724,6 +2048,19 @@ def discover_project_checks(root: Path, config: dict[str, Any] | None = None) ->
     if isinstance(composer_scripts, dict) and "test" in composer_scripts:
         missing = "" if shutil.which("composer") else "composer.json test script found but composer is not installed"
         checks.append(make_check("composer:test", ["composer", "test"], "test", "composer.json", missing))
+
+    if (root / "package-lock.json").exists() or (root / "npm-shrinkwrap.json").exists():
+        missing = "" if npm_available else "npm lockfile found but npm is not installed"
+        checks.append(make_check("npm:audit", ["npm", "audit", "--audit-level=high"], "security", "npm-lockfile", missing))
+
+    if shutil.which("pip-audit") and any((root / name).exists() for name in ["requirements.txt", "requirements-dev.txt", "pyproject.toml", "setup.py"]):
+        checks.append(make_check("pip-audit", ["pip-audit"], "security"))
+
+    if shutil.which("gitleaks"):
+        checks.append(make_check("gitleaks", ["gitleaks", "detect", "--no-banner", "--redact", "--source", "."], "security"))
+
+    if shutil.which("trivy") and any((root / name).exists() for name in ["package-lock.json", "go.sum", "Cargo.lock", "requirements.txt", "poetry.lock", "Dockerfile"]):
+        checks.append(make_check("trivy:fs", ["trivy", "fs", "--scanners", "vuln,secret", "--exit-code", "1", "."], "security"))
 
     for tool, command in [
         ("ruff", ["ruff", "check", "."]),
@@ -2197,6 +2534,37 @@ def markdown_report(session: dict[str, Any]) -> str:
             lines.append("No project checks discovered.")
     lines.append("")
 
+    delta = session.get("session_delta")
+    if delta:
+        lines.extend(["## Session Delta", ""])
+        if delta.get("error"):
+            lines.extend([
+                f"Status: **unavailable**",
+                f"Reason: {delta.get('error')}",
+                "",
+            ])
+        else:
+            lines.extend([
+                f"Old session: `{delta.get('old_session_id') or 'unknown'}`",
+                f"New session: `{delta.get('new_session_id') or 'unknown'}`",
+                f"Old verdict: **{delta.get('old_verdict') or 'unknown'}**",
+                f"New verdict: **{delta.get('new_verdict') or 'unknown'}**",
+                f"Added findings: {len(delta.get('added', []))}",
+                f"Resolved findings: {len(delta.get('resolved', []))}",
+                f"Persisting findings: {len(delta.get('persisting', []))}",
+                "",
+            ])
+            for title, key in [("Added", "added"), ("Resolved", "resolved")]:
+                items = delta.get(key, [])[:8]
+                if not items:
+                    continue
+                lines.append(f"### {title}")
+                lines.append("")
+                for finding in items:
+                    location = f"{finding.get('file', '')}:{finding.get('line', '')}".strip(":") or "n/a"
+                    lines.append(f"- `{finding.get('id')}` {finding.get('severity')} {finding.get('title')} at `{location}`")
+                lines.append("")
+
     jury = session.get("jury_scores", {})
     if jury:
         lines.extend(["## Jury Scores", ""])
@@ -2222,6 +2590,21 @@ def markdown_report(session: dict[str, Any]) -> str:
                 "",
                 f"Status: **{status}**",
             ])
+            structured = item.get("structured")
+            if isinstance(structured, dict):
+                if structured.get("verdict"):
+                    lines.append(f"Structured verdict: **{structured.get('verdict')}**")
+                if structured.get("confidence") is not None:
+                    lines.append(f"Confidence: `{structured.get('confidence')}`")
+                for key, title in [("summary", "Summary"), ("risks", "Risks"), ("questions", "Questions"), ("recommendations", "Recommendations"), ("remaining_risks", "Remaining Risks")]:
+                    value = structured.get(key)
+                    if not value:
+                        continue
+                    lines.extend(["", f"#### {title}", ""])
+                    if isinstance(value, list):
+                        lines.extend([f"- {str(entry)}" for entry in value[:8]])
+                    else:
+                        lines.append(str(value))
             if item.get("output"):
                 lines.extend(["", "```text", str(item.get("output", "")).strip(), "```"])
             lines.append("")
@@ -2314,9 +2697,135 @@ def markdown_session_diff(diff: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def language_label(path: Path) -> str:
+    labels = {
+        ".py": "Python",
+        ".js": "JavaScript",
+        ".jsx": "JavaScript",
+        ".mjs": "JavaScript",
+        ".ts": "TypeScript",
+        ".tsx": "TypeScript",
+        ".vue": "Vue",
+        ".svelte": "Svelte",
+        ".go": "Go",
+        ".rs": "Rust",
+        ".java": "Java",
+        ".cs": "C#",
+        ".php": "PHP",
+        ".kt": "Kotlin",
+        ".kts": "Kotlin",
+        ".swift": "Swift",
+        ".dart": "Dart",
+        ".rb": "Ruby",
+        ".sh": "Shell",
+        ".sql": "SQL",
+    }
+    if path.name == "Dockerfile":
+        return "Docker"
+    return labels.get(path.suffix.lower(), "Other")
+
+
+def detect_project_profile(root: Path) -> dict[str, Any]:
+    files = git_repo_files(root, 500)
+    language_counts: dict[str, int] = {}
+    for path in files:
+        if not is_code_file(path):
+            continue
+        label = language_label(path)
+        language_counts[label] = language_counts.get(label, 0) + 1
+    manifest_names = [
+        "package.json",
+        "package-lock.json",
+        "pyproject.toml",
+        "requirements.txt",
+        "go.mod",
+        "Cargo.toml",
+        "composer.json",
+        "Package.swift",
+        "pubspec.yaml",
+        "Dockerfile",
+    ]
+    manifests = [name for name in manifest_names if (root / name).exists()]
+    checks = discover_project_checks(root, DEFAULT_CONFIG)
+    return {
+        "languages": sorted(language_counts.items(), key=lambda item: (-item[1], item[0])),
+        "manifests": manifests,
+        "checks": [item.get("name", "") for item in checks],
+    }
+
+
+def init_config_text(profile: dict[str, Any]) -> str:
+    languages = ", ".join(name for name, _ in profile.get("languages", [])[:8]) or "none detected"
+    manifests = ", ".join(profile.get("manifests", [])[:12]) or "none detected"
+    checks = [name for name in profile.get("checks", []) if name]
+    lines = [
+        "# Grill Me Code policy",
+        f"# detected_languages: {languages}",
+        f"# detected_manifests: {manifests}",
+        "# detected_checks:",
+    ]
+    if checks:
+        lines.extend([f"#   - {name}" for name in checks[:16]])
+    else:
+        lines.append("#   - none")
+    lines.extend([
+        "",
+        "thresholds:",
+        "  ship_with_risks_risk: 35",
+        "  min_proof_ship: 60",
+        "  failed_check_risk: 20",
+        "  severity_weights:",
+        "    blocker: 30",
+        "    warning: 12",
+        "    question: 5",
+        "    nit: 1",
+        "    blocked: 0",
+        "",
+        "test_proof:",
+        "  mode: code",
+        "",
+        "scan:",
+        "  max_file_bytes: 2000000",
+        "  cache: true",
+        "",
+        "ignore:",
+        "  paths:",
+        "    - dist/**",
+        "    - build/**",
+        "    - coverage/**",
+        "    - node_modules/**",
+        "  codes: []",
+        "  findings: []",
+        "  fingerprints: []",
+        "",
+        "severity_overrides: {}",
+        "static_patterns: []",
+        "check_plugins: []",
+        "analysis_plugins: []",
+        "reasoning_plugins: []",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def write_init_config(root: Path, explicit_path: str | None, force: bool) -> tuple[int, str]:
+    target = (root / (explicit_path or ".grill-me-code.yaml")).resolve()
+    try:
+        target.relative_to(root.resolve())
+    except ValueError:
+        return 2, "Config path is outside the repo."
+    if target.exists() and not force:
+        return 2, f"Config already exists: {target.relative_to(root)}. Re-run with --force-init to replace it."
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(init_config_text(detect_project_profile(root)), encoding="utf-8")
+    return 0, f"Wrote {target.relative_to(root)}"
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a CODE-GRILL engine pass with packet, checks, scoring, state, and verdict.")
     parser.add_argument("--diff-sessions", nargs=2, metavar=("OLD", "NEW"), help="Compare two saved session JSON files and exit.")
+    parser.add_argument("--init", action="store_true", help="Write a starter .grill-me-code config for this repo and exit.")
+    parser.add_argument("--force-init", action="store_true", help="Allow --init to overwrite the target config file.")
     parser.add_argument("--mode", choices=["plan", "diff", "repo", "release", "fix", "scope"], default="diff")
     parser.add_argument("--depth", choices=["quick", "standard", "deep"], default="standard")
     parser.add_argument("--base", help="Optional git diff base, such as origin/main")
@@ -2329,6 +2838,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--no-baseline", action="store_true", help="Do not read the baseline file even if it exists.")
     parser.add_argument("--write-baseline", action="store_true", help="Write or update the baseline with current findings.")
     parser.add_argument("--learning-store", default=".grill-me-code/learnings.json", help="Learning outcomes file used for suppression.")
+    parser.add_argument("--since-session", help="Compare the new run against a previous session JSON and attach the delta.")
     parser.add_argument("--gsd-phase", help="Optional GSD phase prefix to include from .planning/phases.")
     parser.add_argument("--run-checks", action="store_true", help="Run discovered project lint/type/test/security checks.")
     parser.add_argument("--reasoning-command", action="append", default=[], help="Command that receives session JSON on stdin and returns reasoning text. Can be repeated.")
@@ -2345,6 +2855,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    root = repo_root(Path.cwd())
     if args.diff_sessions:
         old_path = Path(args.diff_sessions[0])
         new_path = Path(args.diff_sessions[1])
@@ -2355,12 +2866,16 @@ def main(argv: list[str]) -> int:
             return 2
         diff = diff_sessions(old_session, new_session)
         report = markdown_session_diff(diff)
-        root = repo_root(Path.cwd())
         out_dir = (root / args.output_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "CODE-GRILL-SESSION-DIFF.md").write_text(report, encoding="utf-8")
         print(report)
         return 0
+
+    if args.init:
+        code, message = write_init_config(root, args.config, args.force_init)
+        print(message, file=sys.stderr if code else sys.stdout)
+        return code
 
     if args.mode == "scope" and not args.scope:
         print("--mode scope requires at least one --scope value.", file=sys.stderr)
@@ -2375,7 +2890,6 @@ def main(argv: list[str]) -> int:
         print("--jobs must be a positive integer.", file=sys.stderr)
         return 2
 
-    root = repo_root(Path.cwd())
     config, config_findings, config_path = load_config(root, args.config)
     static_patterns, pattern_config_findings = compile_static_patterns(config)
     _, check_config_findings = configured_check_plugins(config)
@@ -2539,6 +3053,21 @@ def main(argv: list[str]) -> int:
             session["score"] = score
             session["jury_scores"] = jury
         session["reasoning"] = reasoning_outputs
+
+    if args.since_session:
+        since_path = Path(args.since_session)
+        if not since_path.is_absolute():
+            since_path = root / since_path
+        old_session = read_json(since_path)
+        if not old_session:
+            session["session_delta"] = {
+                "path": str(since_path),
+                "error": f"Could not read previous session JSON: {args.since_session}",
+            }
+        else:
+            delta = diff_sessions(old_session, session)
+            session["session_delta"] = delta
+            (out_dir / "CODE-GRILL-SESSION-DIFF.md").write_text(markdown_session_diff(delta), encoding="utf-8")
 
     report_path.write_text(markdown_report(session), encoding="utf-8")
     if cache_enabled:

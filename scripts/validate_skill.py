@@ -97,7 +97,7 @@ def main():
         read(ROOT / rel)
 
     runner = read(ROOT / "scripts" / "grill_runner.py")
-    for token in ["load_config", "write_baseline", "split_suppressed_findings", "ThreadPoolExecutor", "git_changed_lines", "jury_scores", "diff_sessions", "check_plugins", "analysis_plugins", "reasoning_plugins", "javascript_semantic_findings", "test_assertion_metrics", "cached_static_findings", "filter_scan_files", "cross_file_flow_findings", "diff_filter"]:
+    for token in ["load_config", "write_baseline", "split_suppressed_findings", "ThreadPoolExecutor", "git_changed_lines", "jury_scores", "diff_sessions", "check_plugins", "analysis_plugins", "reasoning_plugins", "javascript_semantic_findings", "python_taint_findings", "js_taint_findings", "parse_reasoning_output", "write_init_config", "since_session", "npm:audit", "test_assertion_metrics", "cached_static_findings", "filter_scan_files", "cross_file_flow_findings", "diff_filter"]:
         if token not in runner:
             fail(f"grill_runner.py missing {token}")
 

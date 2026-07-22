@@ -25,7 +25,8 @@ The gap: developers also need a local, forkable, agent-native workflow that:
 - coordinates review -> fix -> re-review with bounded loops
 - keeps artifacts that humans and agents can resume
 - runs available local checks instead of only describing them
-- exposes analysis and reasoning plugin hooks instead of pretending every review is LLM-backed
+- exposes structured analysis and reasoning plugin hooks instead of pretending every review is LLM-backed
+- discovers optional local security backends when available instead of bundling a heavy hosted scanner
 - can skip oversized files with explicit evidence and cache unchanged static findings
 - lets teams tune policy with config, baselines, suppressions, and severity overrides
 - separates introduced risk from legacy risk during diff reviews
@@ -53,9 +54,9 @@ A generated markdown artifact containing scope, risk lenses, hard questions, pro
 
 ### CODE-GRILL Runner
 
-A minimal-dependency CLI that resolves scope, runs configurable static heuristics plus targeted Python AST checks, JS/TS alias heuristics, command-use checks for Go/Rust/Kotlin/Swift/Dart, and lightweight JS/TS cross-file flow signals, discovers project checks and check plugins, optionally runs those checks, separates setup-blocked findings from code risk, separates introduced risk from legacy risk, assigns risk/proof/ship scores plus bands/reasons, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
+A minimal-dependency CLI that resolves scope, runs configurable static heuristics plus targeted Python AST checks, basic Python/JS taint-style reaching-definition checks, JS/TS alias heuristics, command-use checks for Go/Rust/Kotlin/Swift/Dart/Java/C#/PHP, and lightweight JS/TS cross-file flow signals, discovers project checks, security backends, and check plugins, optionally runs those checks, separates setup-blocked findings from code risk, separates introduced risk from legacy risk, assigns risk/proof/ship scores plus bands/reasons, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
 
-It should remain honest: built-in scanning is useful pressure, not full taint analysis or a replacement for CodeQL/Semgrep/language-native SAST. Deep analysis belongs in analysis plugins or project checks.
+It should remain honest: built-in scanning is useful pressure, not full call-graph taint analysis or a replacement for CodeQL/Semgrep/language-native SAST. Deep analysis belongs in analysis plugins, reasoning plugins, or project checks.
 
 ### Plugin Surface
 
@@ -65,6 +66,7 @@ Teams can add:
 - analysis plugins that return machine-readable findings
 - JSONL analysis plugins that stream progress and findings
 - reasoning plugins that receive the session JSON and attach LLM or expert-review output
+- structured reasoning plugins that return JSON verdicts, risks, questions, recommendations, and findings that enter normal scoring
 
 The runner should only claim plugin-backed reasoning when a configured command actually ran.
 
@@ -83,6 +85,8 @@ Baselines and learning records let teams suppress accepted findings by stable fi
 ### Session Compare
 
 Saved sessions can be diffed to show added, resolved, and persisting findings between runs.
+
+Normal runs can also attach a previous-session delta with `--since-session`, which turns re-grilling into an incremental review record rather than a disconnected fresh scan.
 
 ### Jury Mode
 
