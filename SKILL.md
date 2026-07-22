@@ -1,6 +1,6 @@
 ---
 name: grill-me-code
-description: Relentless code grilling, review, and refactor coordination for implementation plans, diffs, repositories, architecture, tests, debugging, releases, and technical decisions. Use when Codex should interrogate code or a plan before shipping, produce hard review questions, classify risks, suggest or apply fixes, run verification, coordinate multi-pass review/fix loops, or adapt GSD-style get-it-done execution patterns to code work.
+description: Relentless high-end code grilling, review, refactor coordination, and proof-backed shipping gates for implementation plans, diffs, repositories, architecture, tests, debugging, releases, and technical decisions. Use when Codex should put code or a plan in the hot seat before shipping, generate a CODE-GRILL-PACKET, run multi-lens adversarial review, classify risks, suggest or apply fixes, run verification, coordinate multi-pass review/fix loops, or adapt GSD-style get-it-done execution patterns to code work.
 ---
 
 # Grill Me Code
@@ -14,6 +14,7 @@ When no runner is available, run the grilling loop inline using this skill.
    - Prefer explicitly named files, diffs, PRs, plans, or commands.
    - Otherwise use the current git diff.
    - If the user asks for repo-wide grilling, sample architecture first, then inspect hot paths.
+   - For a reusable artifact, run `scripts/grill_packet.py` to create `CODE-GRILL-PACKET.md`.
    - Fail closed on unclear destructive or production-impacting actions.
 2. Pick depth:
    - `quick`: fast pattern and risk scan.
@@ -40,6 +41,8 @@ When no runner is available, run the grilling loop inline using this skill.
 - For refactor and fix loops, read `references/refactor-playbook.md`.
 - For GSD-inspired coordination, artifacts, and handoff contracts, read `references/gsd-code-coordination.md`.
 - For reusable prompt shapes, read `references/prompt-patterns.md`.
+- For market positioning and fork-worthy product direction, read `references/market-positioning.md`.
+- For multi-lens adversarial review, read `references/jury-mode.md`.
 
 ## Review Stance
 
@@ -73,3 +76,16 @@ For implementation requests, provide:
 4. re-grill summary
 
 Keep outputs concise unless the user asks for a full artifact.
+
+## Signature Modes
+
+- `Hot Seat`: grill an idea or implementation plan before code exists.
+- `PR Trial`: interrogate a diff or pull request before review.
+- `Refactor Crucible`: prove behavior survives a refactor.
+- `Shiproom`: inspect release, migration, rollback, config, and observability risk.
+- `Fix Receipts`: apply fixes and produce proof commands/results.
+- `Jury Mode`: run the same scope through multiple lenses before verdict.
+
+## Differentiator
+
+Market tools usually start at the PR or static-analysis finding. This skill starts earlier and ends later: plan grilling, packet generation, multi-lens review, fix loop, verification receipts, and a final ship/no-ship verdict.

@@ -14,3 +14,7 @@ jobs:
           python-version: "3.12"
       - name: Validate skill shape
         run: python3 scripts/validate_skill.py
+      - name: Smoke-test packet generator
+        run: |
+          python3 scripts/grill_packet.py --mode repo --max-files 8 --output /tmp/CODE-GRILL-PACKET.md
+          grep -q "## Jury Mode" /tmp/CODE-GRILL-PACKET.md

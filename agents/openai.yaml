@@ -1,4 +1,4 @@
 interface:
   display_name: "Grill Me Code"
-  short_description: "Grill code, plans, diffs, tests, and refactors before shipping."
-  default_prompt: "Use $grill-me-code to grill this code or diff at standard depth, find blockers, suggest fixes, run verification, and re-grill the changed surface."
+  short_description: "Hot-seat code grills with proof-backed ship verdicts."
+  default_prompt: "Use $grill-me-code to generate a CODE-GRILL-PACKET, run Jury Mode at standard depth, find blockers, suggest fixes, verify proof, and give a ship verdict."

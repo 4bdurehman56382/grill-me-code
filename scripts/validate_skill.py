@@ -56,6 +56,8 @@ def main():
         "references/refactor-playbook.md",
         "references/gsd-code-coordination.md",
         "references/prompt-patterns.md",
+        "references/market-positioning.md",
+        "references/jury-mode.md",
     ]
     for rel in required_refs:
         text = read(ROOT / rel)
@@ -73,6 +75,11 @@ def main():
     for marker in ["GRILLING COMPLETE", "ISSUES FOUND", "FIX LOOP COMPLETE", "BLOCKED"]:
         if not re.search(rf"`## {re.escape(marker)}`", skill_text):
             fail(f"SKILL.md missing marker {marker}")
+
+    packet_script = ROOT / "scripts" / "grill_packet.py"
+    read(packet_script)
+    if "CODE-GRILL-PACKET" not in packet_script.read_text(encoding="utf-8"):
+        fail("grill_packet.py should generate CODE-GRILL-PACKET artifacts")
 
     print("skill validation ok")
 
