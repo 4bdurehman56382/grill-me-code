@@ -24,9 +24,11 @@ The gap: developers also need a local, forkable, agent-native workflow that:
 - coordinates review -> fix -> re-review with bounded loops
 - keeps artifacts that humans and agents can resume
 - runs available local checks instead of only describing them
+- exposes analysis and reasoning plugin hooks instead of pretending every review is LLM-backed
 - lets teams tune policy with config, baselines, suppressions, and severity overrides
 - separates introduced risk from legacy risk during diff reviews
 - scores the same scope through explicit runner-backed jury lenses
+- emits CI annotations that land on the file and line developers are already reading
 - records finding outcomes so the team can learn which grills catch real bugs
 
 ## High-End Product Promise
@@ -49,7 +51,21 @@ A generated markdown artifact containing scope, risk lenses, hard questions, pro
 
 ### CODE-GRILL Runner
 
-A minimal-dependency CLI that resolves scope, runs configurable static heuristics plus targeted Python AST checks, discovers project checks and check plugins, optionally runs those checks, separates setup-blocked findings from code risk, separates introduced risk from legacy risk, assigns risk/proof/ship scores, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
+A minimal-dependency CLI that resolves scope, runs configurable static heuristics plus targeted Python AST checks, JS/TS alias heuristics, and compiled-language command-use checks, discovers project checks and check plugins, optionally runs those checks, separates setup-blocked findings from code risk, separates introduced risk from legacy risk, assigns risk/proof/ship scores, persists session JSON, and writes `CODE-GRILL-REPORT.md`.
+
+### Plugin Surface
+
+Teams can add:
+
+- check plugins that run real project commands
+- analysis plugins that return machine-readable findings
+- reasoning plugins that receive the session JSON and attach LLM or expert-review output
+
+The runner should only claim plugin-backed reasoning when a configured command actually ran.
+
+### Test Proof Quality
+
+The runner does not treat every test file as proof. It checks scoped tests for detectable assertions and calls out empty or obviously trivial assertions so `assert True` does not pass as confidence.
 
 ### Policy Memory
 
@@ -71,6 +87,10 @@ The same scope is reviewed through distinct lenses:
 - Maintainer: what will be confusing later?
 
 The runner gives each lens its own score and verdict. LLM-based grilling should use those scores as evidence, then add human-grade reasoning where the script cannot infer intent.
+
+### GitHub Annotations
+
+The CI helper converts active session findings into GitHub Actions annotations so blockers and warnings appear beside the relevant file/line while still preserving the full artifact for deeper review.
 
 ### Fix Receipts
 

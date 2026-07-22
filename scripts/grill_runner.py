@@ -147,7 +147,9 @@ DEFAULT_CONFIG = {
     },
     "severity_overrides": {},
     "static_patterns": [],
+    "analysis_plugins": [],
     "check_plugins": [],
+    "reasoning_plugins": [],
 }
 
 
@@ -273,8 +275,14 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     patterns = config.get("static_patterns")
     config["static_patterns"] = patterns if isinstance(patterns, list) else []
 
+    analysis_plugins = config.get("analysis_plugins")
+    config["analysis_plugins"] = analysis_plugins if isinstance(analysis_plugins, list) else []
+
     check_plugins = config.get("check_plugins")
     config["check_plugins"] = check_plugins if isinstance(check_plugins, list) else []
+
+    reasoning_plugins = config.get("reasoning_plugins")
+    config["reasoning_plugins"] = reasoning_plugins if isinstance(reasoning_plugins, list) else []
     return config
 
 
@@ -370,6 +378,86 @@ def needs_test_proof(files: list[Path], config: dict[str, Any]) -> bool:
     return any(is_test_relevant_file(path) for path in files)
 
 
+def is_trivial_assert_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text.lower()).rstrip(";")
+    trivial_patterns = [
+        r"asserttrue",
+        r"assert\(true\)",
+        r"(?:self\.)?asserttrue\(true\)",
+        r"expect\(true\)\.tobe\(true\)",
+        r"expect\(1\)\.tobe\(1\)",
+        r"(?:assert\.equal|assertequal)\(1,1\)",
+        r"assert_eq!\(1,1\)",
+    ]
+    return any(re.fullmatch(pattern, normalized) for pattern in trivial_patterns)
+
+
+def python_test_assertions(path: Path) -> tuple[int, int]:
+    try:
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        tree = ast.parse(source, filename=str(path))
+    except (OSError, SyntaxError):
+        return 0, 0
+    assertions = 0
+    trivial = 0
+    lines = source.splitlines()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assert):
+            assertions += 1
+            if isinstance(node.test, ast.Constant) and node.test.value is True:
+                trivial += 1
+        elif isinstance(node, ast.Call):
+            name = ast_call_name(node.func).lower()
+            if "assert" in name or name in {"pytest.raises"}:
+                assertions += 1
+                line_number = getattr(node, "lineno", 0) or 0
+                evidence = lines[line_number - 1] if 0 < line_number <= len(lines) else ""
+                if is_trivial_assert_text(evidence):
+                    trivial += 1
+    return assertions, trivial
+
+
+def test_assertion_metrics(root: Path, files: list[Path]) -> dict[str, Any]:
+    assertion_patterns = [
+        re.compile(r"\bexpect\s*\(", re.I),
+        re.compile(r"\bassert(?:\.\w+)?\s*\(", re.I),
+        re.compile(r"\b(?:strictEqual|deepEqual|equal)\s*\(", re.I),
+        re.compile(r"\b(?:t\.Fatal|t\.Error|assert_eq!|assert!)\s*\(", re.I),
+    ]
+    metrics = {
+        "test_files": 0,
+        "assertions": 0,
+        "trivial_assertions": 0,
+        "files_without_assertions": [],
+    }
+    for path in files:
+        if not is_test_file(path):
+            continue
+        metrics["test_files"] += 1
+        if path.suffix == ".py":
+            assertions, trivial = python_test_assertions(path)
+        else:
+            try:
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                lines = []
+            assertions = 0
+            trivial = 0
+            for line in lines:
+                surface = comment_stripped_surface(path, line)
+                if not surface:
+                    continue
+                if any(pattern.search(surface) for pattern in assertion_patterns):
+                    assertions += 1
+                    if is_trivial_assert_text(surface):
+                        trivial += 1
+        metrics["assertions"] += assertions
+        metrics["trivial_assertions"] += trivial
+        if assertions == 0:
+            metrics["files_without_assertions"].append(str(path.relative_to(root)))
+    return metrics
+
+
 def resolve_files(root: Path, args: argparse.Namespace) -> tuple[str, list[Path]]:
     mode = args.mode
     if args.scope:
@@ -433,7 +521,7 @@ def annotate_diff_status(findings: list[dict[str, Any]], changed_lines: dict[str
 
 def finding_code(finding: dict[str, Any]) -> str:
     identifier = str(finding.get("id", ""))
-    return re.sub(r"(?:-AST)?-\d{3}$", "", identifier)
+    return re.sub(r"(?:-(?:AST|JS|COMPILED))?-\d{3}$", "", identifier)
 
 
 def finding_fingerprint(finding: dict[str, Any]) -> str:
@@ -665,6 +753,125 @@ def python_ast_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
     return annotate_findings(findings)
 
 
+def javascript_semantic_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    findings = []
+    ordinal = 1
+    js_extensions = {".js", ".jsx", ".mjs", ".ts", ".tsx"}
+    for path in files:
+        if path.suffix not in js_extensions:
+            continue
+        rel = str(path.relative_to(root))
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        eval_aliases: set[str] = set()
+        child_process_aliases: set[str] = set()
+        child_process_exec_aliases: set[str] = set()
+        for line_number, line in enumerate(lines, start=1):
+            surface = comment_stripped_surface(path, line)
+            if not surface:
+                continue
+
+            for match in re.finditer(r"\b(?:const|let|var)?\s*([A-Za-z_$][\w$]*)\s*=\s*eval\b", surface):
+                eval_aliases.add(match.group(1))
+
+            cp_alias = re.search(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['\"]child_process['\"]\s*\)", surface)
+            if cp_alias:
+                child_process_aliases.add(cp_alias.group(1))
+
+            destructured = re.search(r"\{\s*([^}]+)\s*\}\s*=\s*require\(\s*['\"]child_process['\"]\s*\)", surface)
+            if destructured:
+                for part in destructured.group(1).split(","):
+                    name = part.strip()
+                    if not name:
+                        continue
+                    if ":" in name:
+                        imported, local = [piece.strip() for piece in name.split(":", 1)]
+                    elif " as " in name:
+                        imported, local = [piece.strip() for piece in name.split(" as ", 1)]
+                    else:
+                        imported = local = name
+                    if imported in {"exec", "execSync"}:
+                        child_process_exec_aliases.add(local)
+
+            import_match = re.search(r"import\s+\{\s*([^}]+)\s*\}\s+from\s+['\"]child_process['\"]", surface)
+            if import_match:
+                for part in import_match.group(1).split(","):
+                    name = part.strip()
+                    if not name:
+                        continue
+                    if " as " in name:
+                        imported, local = [piece.strip() for piece in name.split(" as ", 1)]
+                    else:
+                        imported = local = name
+                    if imported in {"exec", "execSync"}:
+                        child_process_exec_aliases.add(local)
+
+            for alias in sorted(eval_aliases):
+                if re.search(rf"\b{re.escape(alias)}\s*\(", surface):
+                    findings.append({
+                        "id": f"SEC-001-JS-{ordinal:03d}",
+                        "severity": "blocker",
+                        "file": rel,
+                        "line": line_number,
+                        "title": "Eval alias invocation can become injection.",
+                        "evidence": line.strip()[:240],
+                        "source": "js-semantic",
+                    })
+                    ordinal += 1
+                    break
+
+            child_process_call = any(re.search(rf"\b{re.escape(alias)}\.(?:exec|execSync)\s*\(", surface) for alias in child_process_aliases)
+            child_process_call = child_process_call or any(re.search(rf"\b{re.escape(alias)}\s*\(", surface) for alias in child_process_exec_aliases)
+            if child_process_call:
+                findings.append({
+                    "id": f"SEC-012-JS-{ordinal:03d}",
+                    "severity": "blocker",
+                    "file": rel,
+                    "line": line_number,
+                    "title": "child_process command execution needs containment proof.",
+                    "evidence": line.strip()[:240],
+                    "source": "js-semantic",
+                })
+                ordinal += 1
+    return annotate_findings(findings)
+
+
+def compiled_language_semantic_findings(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    findings = []
+    ordinal = 1
+    for path in files:
+        if path.suffix not in {".go", ".rs"}:
+            continue
+        rel = str(path.relative_to(root))
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line_number, line in enumerate(lines, start=1):
+            surface = comment_stripped_surface(path, line)
+            if not surface:
+                continue
+            if path.suffix == ".go" and re.search(r"\bexec\.Command\s*\(", surface):
+                title = "Go exec.Command usage needs argument containment proof."
+            elif path.suffix == ".rs" and re.search(r"\b(?:Command::new|std::process::Command::new)\s*\(", surface):
+                title = "Rust process Command usage needs argument containment proof."
+            else:
+                continue
+            findings.append({
+                "id": f"SEC-012-COMPILED-{ordinal:03d}",
+                "severity": "warning",
+                "file": rel,
+                "line": line_number,
+                "title": title,
+                "evidence": line.strip()[:240],
+                "source": "compiled-semantic",
+            })
+            ordinal += 1
+    return annotate_findings(findings)
+
+
 def static_findings(root: Path, files: list[Path], patterns: list[StaticPattern] | None = None) -> list[dict[str, Any]]:
     patterns = patterns or list(BUILTIN_STATIC_PATTERNS)
     findings = []
@@ -704,6 +911,8 @@ def static_findings(root: Path, files: list[Path], patterns: list[StaticPattern]
                     })
                     ordinal += 1
     findings.extend(python_ast_findings(root, files))
+    findings.extend(javascript_semantic_findings(root, files))
+    findings.extend(compiled_language_semantic_findings(root, files))
     return combine_same_line_findings(annotate_findings(findings))
 
 
@@ -811,6 +1020,153 @@ def configured_check_plugins(config: dict[str, Any]) -> tuple[list[dict[str, Any
             continue
         checks.append(make_check(name, command, kind, "config"))
     return checks, findings
+
+
+def configured_command_plugins(config: dict[str, Any], key: str, default_kind: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    plugins = []
+    findings = []
+    for index, item in enumerate(config.get(key, []), start=1):
+        if not isinstance(item, dict):
+            findings.append(config_finding(f"CONFIG-{key.upper()}-{index:03d}", f"{key} entry must be an object"))
+            continue
+        name = str(item.get("name") or f"{key}-{index}")
+        raw_command = item.get("command")
+        kind = str(item.get("kind") or default_kind)
+        if isinstance(raw_command, list):
+            command = [str(part) for part in raw_command]
+        elif isinstance(raw_command, str):
+            command = shlex.split(raw_command)
+        else:
+            findings.append(config_finding(f"CONFIG-{key.upper()}-{index:03d}", f"{key} plugin {name} is missing command"))
+            continue
+        if not command:
+            findings.append(config_finding(f"CONFIG-{key.upper()}-{index:03d}", f"{key} plugin {name} command is empty"))
+            continue
+        plugins.append({"name": name, "command": command, "kind": kind, "source": "config"})
+    return plugins, findings
+
+
+def plugin_unavailable_finding(plugin: dict[str, Any], prefix: str, ordinal: int) -> dict[str, Any]:
+    return {
+        "id": f"{prefix}-MISSING-{ordinal:03d}",
+        "severity": "question",
+        "title": f"Configured {plugin.get('kind', 'plugin')} plugin is unavailable: {plugin.get('name')}",
+        "source": "plugin-discovery",
+        "evidence": " ".join(plugin.get("command", []))[:240],
+    }
+
+
+def run_analysis_plugins(root: Path, plugins: list[dict[str, Any]], payload: dict[str, Any], timeout: int, progress: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    findings = []
+    plugin_results = []
+    for index, plugin in enumerate(plugins, start=1):
+        command = plugin["command"]
+        if not command_available(root, command):
+            findings.append(plugin_unavailable_finding(plugin, "ANALYSIS", index))
+            plugin_results.append({"name": plugin["name"], "ok": False, "missing": True})
+            continue
+        emit_progress(progress, f"running analysis plugin {plugin['name']}")
+        started = utc_now()
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=str(root),
+                input=json.dumps(payload),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            findings.append({
+                "id": f"ANALYSIS-TIMEOUT-{index:03d}",
+                "severity": "question",
+                "title": f"Analysis plugin timed out: {plugin['name']}",
+                "source": "analysis-plugin",
+            })
+            plugin_results.append({"name": plugin["name"], "ok": False, "timed_out": True})
+            continue
+        plugin_results.append({"name": plugin["name"], "ok": proc.returncode == 0, "returncode": proc.returncode, "started": started})
+        if proc.returncode != 0:
+            findings.append({
+                "id": f"ANALYSIS-FAILED-{index:03d}",
+                "severity": "question",
+                "title": f"Analysis plugin failed: {plugin['name']}",
+                "source": "analysis-plugin",
+                "evidence": proc.stdout[-240:],
+            })
+            continue
+        try:
+            parsed = json.loads(proc.stdout or "[]")
+        except json.JSONDecodeError:
+            findings.append({
+                "id": f"ANALYSIS-BADJSON-{index:03d}",
+                "severity": "question",
+                "title": f"Analysis plugin did not return JSON: {plugin['name']}",
+                "source": "analysis-plugin",
+                "evidence": proc.stdout[-240:],
+            })
+            continue
+        plugin_findings = parsed.get("findings", parsed) if isinstance(parsed, dict) else parsed
+        if not isinstance(plugin_findings, list):
+            continue
+        for item in plugin_findings:
+            if not isinstance(item, dict):
+                continue
+            item.setdefault("id", f"PLUGIN-{index:03d}-{len(findings) + 1:03d}")
+            item.setdefault("severity", "question")
+            item.setdefault("title", f"Analysis plugin finding from {plugin['name']}")
+            item.setdefault("source", f"analysis-plugin:{plugin['name']}")
+            findings.append(item)
+    return annotate_findings(findings), plugin_results
+
+
+def run_reasoning_plugins(root: Path, plugins: list[dict[str, Any]], session: dict[str, Any], timeout: int, progress: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    outputs = []
+    findings = []
+    for index, plugin in enumerate(plugins, start=1):
+        command = plugin["command"]
+        if not command_available(root, command):
+            findings.append(plugin_unavailable_finding(plugin, "REASONING", index))
+            outputs.append({"name": plugin["name"], "ok": False, "missing": True})
+            continue
+        emit_progress(progress, f"running reasoning plugin {plugin['name']}")
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=str(root),
+                input=json.dumps(session),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            findings.append({
+                "id": f"REASONING-TIMEOUT-{index:03d}",
+                "severity": "question",
+                "title": f"Reasoning plugin timed out: {plugin['name']}",
+                "source": "reasoning-plugin",
+            })
+            outputs.append({"name": plugin["name"], "ok": False, "timed_out": True})
+            continue
+        outputs.append({
+            "name": plugin["name"],
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "output": proc.stdout[-8000:],
+        })
+        if proc.returncode != 0:
+            findings.append({
+                "id": f"REASONING-FAILED-{index:03d}",
+                "severity": "question",
+                "title": f"Reasoning plugin failed: {plugin['name']}",
+                "source": "reasoning-plugin",
+                "evidence": proc.stdout[-240:],
+            })
+    return outputs, annotate_findings(findings)
 
 
 def check_health_findings(root: Path, checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -997,6 +1353,7 @@ def score_session(
     code_files: int,
     config: dict[str, Any] | None = None,
     diff_aware: bool = False,
+    test_assertions: int | None = None,
 ) -> dict[str, Any]:
     config = config or DEFAULT_CONFIG
     thresholds = config.get("thresholds", {})
@@ -1020,6 +1377,16 @@ def score_session(
     check_risk = len(failed_checks) * int(thresholds.get("failed_check_risk", 20))
     introduced_risk = weighted_risk(introduced_findings)
     legacy_risk = weighted_risk(legacy_findings)
+    if legacy_risk == 0:
+        legacy_risk_level = "none"
+    elif legacy_risk < 30:
+        legacy_risk_level = "low"
+    elif legacy_risk < 60:
+        legacy_risk_level = "medium"
+    elif legacy_risk < 90:
+        legacy_risk_level = "high"
+    else:
+        legacy_risk_level = "critical"
     total_risk = min(100, introduced_risk + legacy_risk + check_risk)
     risk = introduced_risk + check_risk if diff_aware else total_risk
     risk = min(100, risk)
@@ -1027,8 +1394,10 @@ def score_session(
     proof = 0
     if files:
         proof += 20
-    if test_files:
+    if test_files and (test_assertions is None or test_assertions > 0):
         proof += 20
+    elif test_files:
+        proof += 5
     if passed_checks:
         proof += min(40, len(passed_checks) * 15)
     if not failed_checks and check_results:
@@ -1057,6 +1426,7 @@ def score_session(
         "risk_score": risk,
         "introduced_risk_score": min(100, introduced_risk + check_risk),
         "legacy_risk_score": min(100, legacy_risk),
+        "legacy_risk_level": legacy_risk_level,
         "total_risk_score": total_risk,
         "proof_score": proof,
         "ship_score": ship_score,
@@ -1209,6 +1579,7 @@ def markdown_report(session: dict[str, Any]) -> str:
         f"Risk score: **{score['risk_score']}/100**",
         f"Introduced risk: **{score.get('introduced_risk_score', score['risk_score'])}/100**",
         f"Legacy risk: **{score.get('legacy_risk_score', 0)}/100**",
+        f"Legacy risk level: **{score.get('legacy_risk_level', 'none')}**",
         f"Total risk: **{score.get('total_risk_score', score['risk_score'])}/100**",
         f"Proof score: **{score['proof_score']}/100**",
         f"Ship score: **{score['ship_score']}/100**",
@@ -1230,6 +1601,12 @@ def markdown_report(session: dict[str, Any]) -> str:
         f"Config: `{session.get('config_path') or 'default'}`",
         f"Baseline: `{session.get('baseline', {}).get('path') or 'disabled'}`",
         f"Suppressed findings: {len(suppressed)}",
+        "",
+        "## Test Proof",
+        "",
+        f"Test files: {session.get('test_assertions', {}).get('test_files', session.get('test_files', 0))}",
+        f"Assertions found: {session.get('test_assertions', {}).get('assertions', 0)}",
+        f"Trivial assertions: {session.get('test_assertions', {}).get('trivial_assertions', 0)}",
         "",
         "## Findings",
         "",
@@ -1292,6 +1669,20 @@ def markdown_report(session: dict[str, Any]) -> str:
                 "",
             ])
         lines.append("")
+
+    reasoning = session.get("reasoning", [])
+    if reasoning:
+        lines.extend(["## Reasoning Plugins", ""])
+        for item in reasoning:
+            status = "PASS" if item.get("ok") else "FAIL"
+            lines.extend([
+                f"### {item.get('name', 'reasoning')}",
+                "",
+                f"Status: **{status}**",
+            ])
+            if item.get("output"):
+                lines.extend(["", "```text", str(item.get("output", "")).strip(), "```"])
+            lines.append("")
 
     gsd = session["gsd"]
     lines.extend(["## GSD Bridge", ""])
@@ -1397,6 +1788,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--learning-store", default=".grill-me-code/learnings.json", help="Learning outcomes file used for suppression.")
     parser.add_argument("--gsd-phase", help="Optional GSD phase prefix to include from .planning/phases.")
     parser.add_argument("--run-checks", action="store_true", help="Run discovered project lint/type/test/security checks.")
+    parser.add_argument("--reasoning-command", action="append", default=[], help="Command that receives session JSON on stdin and returns reasoning text. Can be repeated.")
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per command in seconds.")
     parser.add_argument("--jobs", type=int, default=max(1, min(8, os.cpu_count() or 1)), help="Parallel syntax-check worker count.")
     parser.add_argument("--progress", action="store_true", help="Print incremental progress to stderr while checks run.")
@@ -1442,6 +1834,10 @@ def main(argv: list[str]) -> int:
     config, config_findings, config_path = load_config(root, args.config)
     static_patterns, pattern_config_findings = compile_static_patterns(config)
     _, check_config_findings = configured_check_plugins(config)
+    analysis_plugins, analysis_config_findings = configured_command_plugins(config, "analysis_plugins", "analysis")
+    reasoning_plugins, reasoning_config_findings = configured_command_plugins(config, "reasoning_plugins", "reasoning")
+    for index, command_text in enumerate(args.reasoning_command, start=1):
+        reasoning_plugins.append({"name": f"cli-reasoning-{index}", "command": shlex.split(command_text), "kind": "reasoning", "source": "cli"})
     mode, files = resolve_files(root, args)
     changed_lines = git_changed_lines(root, args.base) if mode == "diff" else {}
     diff_aware = bool(changed_lines)
@@ -1463,16 +1859,43 @@ def main(argv: list[str]) -> int:
     raw_findings.extend(config_findings)
     raw_findings.extend(pattern_config_findings)
     raw_findings.extend(check_config_findings)
+    raw_findings.extend(analysis_config_findings)
+    raw_findings.extend(reasoning_config_findings)
     raw_findings.extend(static_findings(root, files, static_patterns))
+    plugin_payload = {
+        "root": str(root),
+        "mode": mode,
+        "depth": args.depth,
+        "files": [str(path.relative_to(root)) for path in files],
+        "changed_lines": {path: sorted(lines) for path, lines in changed_lines.items()},
+    }
+    analysis_plugin_findings, analysis_plugin_results = run_analysis_plugins(root, analysis_plugins, plugin_payload, min(args.timeout, 60), args.progress)
+    raw_findings.extend(analysis_plugin_findings)
     raw_findings.extend(analyze_plan_cross_reference(root, files, args.plan))
     test_files = sum(1 for path in files if is_test_file(path))
     code_files = sum(1 for path in files if is_code_file(path))
     test_relevant_files = sum(1 for path in files if is_test_relevant_file(path))
+    assertion_metrics = test_assertion_metrics(root, files)
     if needs_test_proof(files, config) and test_relevant_files and test_files == 0:
         raw_findings.append({
             "id": "TEST-PROOF-001",
             "severity": "warning",
             "title": "No test files are included in the reviewed scope",
+            "source": "test-aware-verification",
+        })
+    elif test_files and assertion_metrics["assertions"] == 0:
+        raw_findings.append({
+            "id": "TEST-PROOF-002",
+            "severity": "warning",
+            "title": "Scoped test files contain no detectable assertions",
+            "source": "test-aware-verification",
+            "evidence": ", ".join(assertion_metrics["files_without_assertions"])[:240],
+        })
+    elif test_files and assertion_metrics["assertions"] == assertion_metrics["trivial_assertions"]:
+        raw_findings.append({
+            "id": "TEST-PROOF-003",
+            "severity": "warning",
+            "title": "Scoped test assertions appear trivial",
             "source": "test-aware-verification",
         })
     discovered_checks = discover_project_checks(root, config)
@@ -1504,7 +1927,7 @@ def main(argv: list[str]) -> int:
     check_results = syntax_results + project_results
 
     gsd = detect_gsd(root, args.gsd_phase)
-    score = score_session(files, findings, check_results, test_files, code_files, config, diff_aware)
+    score = score_session(files, findings, check_results, test_files, code_files, config, diff_aware, int(assertion_metrics["assertions"] - assertion_metrics["trivial_assertions"]))
     jury = jury_scores(findings, check_results, config)
     session = {
         "session_id": session_id,
@@ -1517,6 +1940,7 @@ def main(argv: list[str]) -> int:
         "code_files": code_files,
         "test_files": test_files,
         "test_relevant_files": test_relevant_files,
+        "test_assertions": assertion_metrics,
         "changed_lines": {path: sorted(lines) for path, lines in changed_lines.items()},
         "packet": display_path(packet_path, root),
         "report": display_path(report_path, root),
@@ -1528,6 +1952,8 @@ def main(argv: list[str]) -> int:
             "results": check_results,
             "run_project_checks": args.run_checks,
         },
+        "analysis_plugins": analysis_plugin_results,
+        "reasoning": [],
         "baseline": {
             "path": "" if args.no_baseline else display_path(baseline_path, root),
             "read": baseline_was_read,
@@ -1539,6 +1965,20 @@ def main(argv: list[str]) -> int:
         "score": score,
         "jury_scores": jury,
     }
+
+    reasoning_outputs, reasoning_findings = run_reasoning_plugins(root, reasoning_plugins, session, min(args.timeout, 120), args.progress)
+    if reasoning_outputs or reasoning_findings:
+        if reasoning_findings:
+            raw_findings.extend(annotate_diff_status(reasoning_findings, changed_lines))
+            findings, suppressed_findings = split_suppressed_findings(annotate_findings(raw_findings), config, baseline, learnings)
+            score = score_session(files, findings, check_results, test_files, code_files, config, diff_aware, int(assertion_metrics["assertions"] - assertion_metrics["trivial_assertions"]))
+            jury = jury_scores(findings, check_results, config)
+            session["raw_findings"] = raw_findings
+            session["findings"] = findings
+            session["suppressed_findings"] = suppressed_findings
+            session["score"] = score
+            session["jury_scores"] = jury
+        session["reasoning"] = reasoning_outputs
 
     report_path.write_text(markdown_report(session), encoding="utf-8")
     write_json(sessions_dir / f"{session_id}.json", session)

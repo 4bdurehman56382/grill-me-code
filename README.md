@@ -20,8 +20,11 @@ It is designed to be forkable: runner scripts with minimal dependencies, stable 
 - **Config file:** `.grill-me-code.yaml`, `.grill-me-code.yml`, or `.grill-me-code.json` can tune thresholds, severity overrides, suppressions, and custom static patterns.
 - **Baselines and learnings:** known accepted findings can be suppressed by stable fingerprints instead of reappearing forever.
 - **Diff-aware scoring:** diff mode separates introduced findings from legacy findings in changed files.
+- **Semantic checks:** Python AST checks plus JS/TS alias heuristics catch some risks that plain regex misses.
+- **Test proof checks:** scoped tests are checked for detectable non-trivial assertions.
 - **Runner Jury Mode:** Breaker, Security, Tester, Refactorer, Release Captain, and Maintainer each get a per-lens score.
-- **Check plugins:** teams can register extra commands without editing the runner.
+- **Plugin hooks:** teams can register check, analysis, and reasoning commands without editing the runner.
+- **GitHub annotations:** CI can emit file/line annotations from `latest.json`.
 - **Fix Receipts:** every fix should include files changed, verification command, result, and remaining risk.
 - **Ship Verdict:** `SHIP`, `SHIP WITH RISKS`, `DO NOT SHIP`, or `BLOCKED`.
 - **Pre-code grilling:** interrogates plans before code exists, not just PRs after the damage is done.
@@ -88,6 +91,7 @@ python3 scripts/grill_runner.py --mode diff --depth standard
 python3 scripts/grill_runner.py --mode repo --depth deep --max-files 40 --run-checks
 python3 scripts/grill_runner.py --scope SKILL.md,scripts/grill_runner.py --plan README.md --run-checks
 python3 scripts/grill_runner.py --mode repo --run-checks --progress --jobs 8
+python3 scripts/grill_runner.py --mode diff --reasoning-command "llm prompt --system 'Review this CODE-GRILL session JSON.'"
 python3 scripts/grill_runner.py --diff-sessions .grill-me-code/sessions/old.json .grill-me-code/latest.json
 ```
 
@@ -128,9 +132,19 @@ check_plugins:
   - name: go-test
     command: ["go", "test", "./..."]
     kind: test
+analysis_plugins:
+  - name: custom-sast
+    command: ["python3", "tools/custom_sast.py"]
+    kind: analysis
+reasoning_plugins:
+  - name: llm-reviewer
+    command: ["llm", "prompt", "--system", "Review this CODE-GRILL session JSON."]
+    kind: reasoning
 ```
 
-The score is a transparent heuristic, not a calibrated probability. `scripts/calibrate_scores.py` runs the small corpus in `calibration/cases.json` so threshold changes have visible expected outcomes.
+Analysis plugins receive a JSON payload on stdin and should return a JSON list of findings or `{ "findings": [...] }`. Reasoning plugins receive the session JSON on stdin and their output is attached to the report. The runner does not claim LLM-backed reasoning unless one of those commands actually runs.
+
+The score is a transparent heuristic, not a calibrated probability. `scripts/calibrate_scores.py` runs the verdict corpus in `calibration/cases.json` so threshold changes have visible expected outcomes.
 
 ## Skill Contents
 
@@ -141,6 +155,7 @@ The score is a transparent heuristic, not a calibrated probability. `scripts/cal
 - `scripts/grill_runner.py`: runs packet generation, static checks, project check discovery, scoring, state, and report output.
 - `scripts/grill_learn.py`: records finding outcomes for the learning loop.
 - `scripts/calibrate_scores.py`: checks scoring thresholds against known expected cases.
+- `scripts/github_annotations.py`: emits GitHub Actions annotations from a session JSON.
 - `scripts/validate_skill.py`: local structural validation.
 - `.grill-me-code.example.yaml`: configurable policy example.
 - `calibration/cases.json`: expected verdict cases for scoring drift checks.
@@ -157,10 +172,11 @@ python3 -m unittest discover -s tests
 python3 scripts/calibrate_scores.py
 python3 scripts/grill_packet.py --mode repo --max-files 8 --output /tmp/CODE-GRILL-PACKET.md
 python3 scripts/grill_runner.py --mode repo --max-files 8 --output-dir /tmp/grill-me-code
+python3 scripts/github_annotations.py --session /tmp/grill-me-code/latest.json
 ```
 
 The GitHub Actions workflow runs the same validator.
 
 ## CI Template
 
-`assets/github-actions/grill-me-code.yml` is designed for normal `pull_request` runs with read-only permissions. It fetches the base branch so fork PR diffs can be compared without using `pull_request_target` or granting untrusted code a write token.
+`assets/github-actions/grill-me-code.yml` is designed for normal `pull_request` runs with read-only permissions. It fetches the base branch so fork PR diffs can be compared without using `pull_request_target` or granting untrusted code a write token. The workflow uploads `.grill-me-code/` and emits GitHub Actions annotations for active findings.

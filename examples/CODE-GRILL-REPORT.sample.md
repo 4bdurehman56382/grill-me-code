@@ -16,6 +16,7 @@ Decision: **DO NOT SHIP**
 Risk score: **62/100**
 Introduced risk: **42/100**
 Legacy risk: **20/100**
+Legacy risk level: **low**
 Total risk: **62/100**
 Proof score: **40/100**
 Ship score: **28/100**
@@ -32,6 +33,12 @@ Legacy findings: 1
 Config: `.grill-me-code.yaml`
 Baseline: `.grill-me-code/baseline.json`
 Suppressed findings: 1
+
+## Test Proof
+
+Test files: 0
+Assertions found: 0
+Trivial assertions: 0
 
 ## Findings
 
@@ -58,6 +65,16 @@ Evidence: n/a
 - **FAIL** `npm run test`
   - kind: `test`
   - timed out: `False`
+
+## Reasoning Plugins
+
+### llm-reviewer
+
+Status: **PASS**
+
+```text
+The blocker is real unless the token source is replaced with environment-backed configuration.
+```
 
 ## Jury Scores
 

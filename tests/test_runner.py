@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import grill_packet
 import grill_learn
+import github_annotations
 import grill_runner
 
 
@@ -64,6 +65,51 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual(len(findings), 1)
             self.assertEqual(findings[0]["code"], "SEC-012")
             self.assertEqual(findings[0]["source"], "python-ast")
+
+    def test_js_semantic_detects_eval_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.js"
+            source.write_text("const run = eval;\nrun(userInput);\n", encoding="utf-8")
+            findings = grill_runner.static_findings(root, [source])
+            self.assertEqual(findings[0]["code"], "SEC-001")
+            self.assertEqual(findings[0]["source"], "js-semantic")
+
+    def test_js_semantic_detects_child_process_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.js"
+            source.write_text("const { exec: run } = require('child_process');\nrun(userInput);\n", encoding="utf-8")
+            findings = grill_runner.static_findings(root, [source])
+            self.assertEqual(findings[0]["code"], "SEC-012")
+            self.assertEqual(findings[0]["source"], "js-semantic")
+
+    def test_test_assertion_metrics_flags_empty_and_trivial_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            empty = root / "empty.test.js"
+            trivial = root / "test_app.py"
+            empty.write_text("describe('x', () => {});\n", encoding="utf-8")
+            trivial.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+            metrics = grill_runner.test_assertion_metrics(root, [empty, trivial])
+            self.assertEqual(metrics["test_files"], 2)
+            self.assertEqual(metrics["assertions"], 1)
+            self.assertEqual(metrics["trivial_assertions"], 1)
+            self.assertEqual(metrics["files_without_assertions"], ["empty.test.js"])
+
+    def test_truthiness_assertion_with_value_is_not_trivial(self):
+        self.assertTrue(grill_runner.is_trivial_assert_text("assert True"))
+        self.assertFalse(grill_runner.is_trivial_assert_text("self.assertTrue(result.ok)"))
+        self.assertFalse(grill_runner.is_trivial_assert_text("expect(result.ok).toBe(true)"))
+
+    def test_compiled_semantic_detects_go_exec_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "main.go"
+            source.write_text("package main\nfunc run(user string) { exec.Command(user) }\n", encoding="utf-8")
+            findings = grill_runner.static_findings(root, [source])
+            self.assertEqual(findings[0]["code"], "SEC-012")
+            self.assertEqual(findings[0]["source"], "compiled-semantic")
 
     def test_rule_priority_combines_same_line_highest_severity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,12 +213,16 @@ class GrillRunnerTests(unittest.TestCase):
             "findings": [],
             "suppressed_findings": [{"id": "BUG-002-001", "title": "TODO", "file": "app.py", "line": 1, "suppressed_by": "baseline"}],
             "checks": {"results": [], "discovered": [], "run_project_checks": False},
+            "test_assertions": {"test_files": 1, "assertions": 1, "trivial_assertions": 0},
+            "reasoning": [{"name": "reason", "ok": True, "output": "looks good"}],
             "gsd": {"detected": False},
             "score": {"verdict": "SHIP", "risk_score": 0, "proof_score": 80, "ship_score": 100},
         }
         report = grill_runner.markdown_report(session)
         self.assertIn("Suppressed findings: 1", report)
         self.assertIn("## Suppressed Findings", report)
+        self.assertIn("## Test Proof", report)
+        self.assertIn("## Reasoning Plugins", report)
 
     def test_discover_project_checks_reads_package_scripts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -196,6 +246,31 @@ class GrillRunnerTests(unittest.TestCase):
             health = grill_runner.check_health_findings(root, checks)
             self.assertEqual(health[0]["severity"], "question")
             self.assertIn("missing-tool", health[0]["title"])
+
+    def test_analysis_plugin_findings_are_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin = root / "plugin.py"
+            plugin.write_text(
+                "import json, sys\n"
+                "json.load(sys.stdin)\n"
+                "print(json.dumps({'findings':[{'id':'PLUGIN-001','severity':'warning','title':'plugin finding','file':'app.py','line':1,'source':'plugin'}]}))\n",
+                encoding="utf-8",
+            )
+            plugins = [{"name": "plugin", "command": [sys.executable, str(plugin)], "kind": "analysis"}]
+            findings, results = grill_runner.run_analysis_plugins(root, plugins, {"files": []}, timeout=5)
+            self.assertTrue(results[0]["ok"])
+            self.assertEqual(findings[0]["id"], "PLUGIN-001")
+
+    def test_reasoning_plugin_output_is_captured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin = root / "reason.py"
+            plugin.write_text("import sys, json\njson.load(sys.stdin)\nprint('reasoned')\n", encoding="utf-8")
+            plugins = [{"name": "reason", "command": [sys.executable, str(plugin)], "kind": "reasoning"}]
+            outputs, findings = grill_runner.run_reasoning_plugins(root, plugins, {"score": {}}, timeout=5)
+            self.assertEqual(findings, [])
+            self.assertEqual(outputs[0]["output"].strip(), "reasoned")
 
     def test_run_project_checks_records_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -315,6 +390,7 @@ class GrillRunnerTests(unittest.TestCase):
         score = grill_runner.score_session([Path("app.py")], [finding], [], test_files=1, code_files=1, diff_aware=True)
         self.assertEqual(score["legacy_blockers"], 1)
         self.assertEqual(score["introduced_blockers"], 0)
+        self.assertEqual(score["legacy_risk_level"], "medium")
         self.assertEqual(score["verdict"], "SHIP WITH RISKS")
 
     def test_jury_scores_security_lens(self):
@@ -356,6 +432,39 @@ class GrillRunnerTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertTrue(data["outcomes"][0]["session_verified"])
             self.assertEqual(data["outcomes"][0]["fingerprint"], finding["fingerprint"])
+
+    def test_grill_learn_deduplicates_same_outcome(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "latest.json"
+            store = root / "learnings.json"
+            finding = {"id": "SEC-001-001", "severity": "blocker", "file": "danger.py", "title": "Danger", "evidence": "eval(x)", "source": "builtin-static"}
+            grill_runner.annotate_findings([finding])
+            session.write_text(json.dumps({"findings": [finding]}), encoding="utf-8")
+            args = ["--finding", "SEC-001-001", "--outcome", "false_positive", "--session", str(session), "--store", str(store)]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(grill_learn.main(args), 0)
+                self.assertEqual(grill_learn.main(args), 0)
+            data = json.loads(store.read_text(encoding="utf-8"))
+            self.assertEqual(len(data["outcomes"]), 1)
+            self.assertEqual(data["outcomes"][0]["count"], 2)
+
+    def test_github_annotations_emit_file_line(self):
+        session = {
+            "findings": [{
+                "id": "SEC-001-001",
+                "severity": "blocker",
+                "file": "app.py",
+                "line": 7,
+                "title": "Danger",
+                "source": "test",
+                "diff_status": "introduced",
+                "evidence": "eval(x)",
+            }]
+        }
+        lines = github_annotations.annotation_lines(session)
+        self.assertIn("::error file=app.py,line=7", lines[0])
+        self.assertIn("SEC-001-001", lines[0])
 
     def test_grill_learn_rejects_unknown_session_finding(self):
         with tempfile.TemporaryDirectory() as tmp:

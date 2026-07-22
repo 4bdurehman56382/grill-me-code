@@ -34,6 +34,9 @@ jobs:
             --run-checks \
             --progress \
             --fail-on-do-not-ship
+      - name: Annotate findings
+        if: always()
+        run: python3 scripts/github_annotations.py --session .grill-me-code/latest.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

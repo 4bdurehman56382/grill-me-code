@@ -23,7 +23,7 @@ def load(path: Path) -> dict:
 
 
 def finding_code(identifier: str) -> str:
-    return re.sub(r"-\d{3}$", "", identifier)
+    return re.sub(r"(?:-(?:AST|JS|COMPILED))?-\d{3}$", "", identifier)
 
 
 def finding_fingerprint(finding: dict) -> str:
@@ -43,6 +43,10 @@ def find_session_finding(session: dict, finding_id: str) -> dict | None:
             if isinstance(finding, dict) and finding.get("id") == finding_id:
                 return finding
     return None
+
+
+def dedup_key(entry: dict) -> tuple[str, str]:
+    return (str(entry.get("fingerprint") or entry.get("finding")), str(entry.get("outcome")))
 
 
 def main(argv: list[str]) -> int:
@@ -90,7 +94,28 @@ def main(argv: list[str]) -> int:
             "title": session_finding.get("title", ""),
             "source": session_finding.get("source", ""),
         }
-    data.setdefault("outcomes", []).append(entry)
+    outcomes = data.setdefault("outcomes", [])
+    key = dedup_key(entry)
+    for existing in outcomes:
+        if isinstance(existing, dict) and dedup_key(existing) == key:
+            existing["count"] = int(existing.get("count", 1)) + 1
+            existing["last_recorded"] = entry["recorded"]
+            existing["session"] = entry["session"]
+            existing["session_verified"] = entry["session_verified"]
+            if entry.get("fingerprint"):
+                existing["fingerprint"] = entry["fingerprint"]
+            if entry.get("finding_snapshot"):
+                existing["finding_snapshot"] = entry["finding_snapshot"]
+            if args.note:
+                notes = existing.setdefault("notes", [])
+                if isinstance(notes, list) and args.note not in notes:
+                    notes.append(args.note)
+            break
+    else:
+        entry["count"] = 1
+        if args.note:
+            entry["notes"] = [args.note]
+        outcomes.append(entry)
     store.parent.mkdir(parents=True, exist_ok=True)
     store.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     suffix = " with session fingerprint" if session_verified else " without session verification"

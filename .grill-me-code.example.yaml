@@ -36,3 +36,13 @@ check_plugins:
   - name: go-test
     command: ["go", "test", "./..."]
     kind: test
+
+analysis_plugins:
+  - name: custom-sast
+    command: ["python3", "tools/custom_sast.py"]
+    kind: analysis
+
+reasoning_plugins:
+  - name: llm-reviewer
+    command: ["llm", "prompt", "--system", "Review this CODE-GRILL session JSON."]
+    kind: reasoning

@@ -25,6 +25,7 @@ def main(argv: list[str]) -> int:
             code_files=int(case.get("code_files", 1)),
             config=config,
             diff_aware=bool(case.get("diff_aware", False)),
+            test_assertions=case.get("test_assertions"),
         )
         if score["verdict"] != case["expected_verdict"]:
             failures.append(f"{case['name']}: expected {case['expected_verdict']}, got {score['verdict']}")
